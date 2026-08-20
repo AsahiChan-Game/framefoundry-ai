@@ -1,0 +1,43 @@
+name: Bug report / 缺陷反馈
+description: 报告可以稳定复现的问题
+title: "[Bug] "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: 请先确认问题可以在最新版本中复现，并移除日志中的密钥和本地隐私路径。
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      placeholder: v1.0.0
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: 问题描述
+      description: 说明预期结果和实际结果。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      placeholder: |
+        1. 启动……
+        2. 选择……
+        3. 看到……
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境
+      placeholder: Windows 11、Node.js 22.13、Python 3.11、ComfyUI 版本
+  - type: textarea
+    id: logs
+    attributes:
+      label: 相关日志
+      description: 请先删除 API Key、Token、用户名和私人目录。
+      render: shell
