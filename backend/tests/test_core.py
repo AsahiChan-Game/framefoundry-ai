@@ -21,10 +21,25 @@ class WorkflowTests(unittest.TestCase):
             }
         }
         hydrated = substitute_placeholders(
-            workflow, {"prompt": "测试画面", "seed": 42}
+            workflow, {"prompt": "测试画面", "seed": 42, "reference_paths": ["a.png", "b.png"]}
         )
         self.assertEqual(hydrated["1"]["inputs"]["text"], "测试画面")
         self.assertEqual(hydrated["1"]["inputs"]["seed"], 42)
+
+        multi_reference_workflow = {
+            "2": {
+                "class_type": "ReferenceNode",
+                "inputs": {"paths": "{{reference_paths}}"},
+            }
+        }
+        hydrated_references = substitute_placeholders(
+            multi_reference_workflow,
+            {"reference_paths": ["a.png", "b.png"]},
+        )
+        self.assertEqual(
+            hydrated_references["2"]["inputs"]["paths"],
+            ["a.png", "b.png"],
+        )
 
     def test_validate_reports_nodes_and_placeholders(self) -> None:
         workflow = {
@@ -64,6 +79,39 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(store.recover_interrupted(), 1)
             self.assertEqual(store.get("job-1")["status"], "failed")
             self.assertEqual(store.list()[0]["id"], "job-1")
+
+    def test_asset_lifecycle_and_job_association(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "test.db")
+            store.initialize()
+            asset = store.create_asset(
+                {
+                    "id": "asset-1",
+                    "name": "橘猫角色",
+                    "kind": "character",
+                    "tags": ["角色", "橘猫"],
+                    "control": "identity",
+                    "file_name": "cat.png",
+                    "mime_type": "image/png",
+                    "file_path": str(Path(directory) / "cat.png"),
+                }
+            )
+            self.assertEqual(asset["tags"], ["角色", "橘猫"])
+            self.assertTrue(asset["has_file"])
+            created = store.create(
+                {
+                    "id": "job-assets",
+                    "name": "多参考任务",
+                    "prompt": "猫在走廊中前进",
+                    "mode": "Ref2VA",
+                    "resolution": "768P",
+                    "duration_seconds": 15,
+                    "simulated": True,
+                    "asset_ids": ["asset-1"],
+                }
+            )
+            self.assertEqual(created["asset_ids"], ["asset-1"])
+            self.assertEqual(store.asset_paths(["asset-1"]), [asset["file_path"]])
 
 
 if __name__ == "__main__":

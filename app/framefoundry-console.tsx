@@ -2,6 +2,7 @@
 
 import {
   Activity,
+  AudioLines,
   Aperture,
   Archive,
   Bell,
@@ -16,15 +17,20 @@ import {
   Film,
   FolderOpen,
   Gauge,
+  Grid2X2,
+  Image as ImageIcon,
   ImagePlus,
   Layers3,
   LayoutDashboard,
   LoaderCircle,
+  List,
   Menu,
   MonitorDot,
   MoreHorizontal,
   Play,
+  Palette,
   Plus,
+  PackageOpen,
   RefreshCw,
   Search,
   Server,
@@ -34,6 +40,7 @@ import {
   Square,
   TerminalSquare,
   Upload,
+  UserRound,
   WandSparkles,
   X,
 } from "lucide-react";
@@ -43,6 +50,8 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 type Section = "create" | "queue" | "workflows" | "assets" | "nodes";
 type NodeState = "online" | "offline" | "checking";
 type JobState = "queued" | "running" | "completed" | "failed" | "cancelled";
+type AssetKind = "character" | "scene" | "style" | "prop" | "audio" | "custom";
+type AssetControl = "identity" | "scene" | "style" | "prop" | "audio" | "reference";
 
 type PipelineNode = {
   id: string;
@@ -66,6 +75,22 @@ type Job = {
   resolution: string;
   simulated: boolean;
   output_path?: string | null;
+  asset_ids: string[];
+};
+
+type Asset = {
+  id: string;
+  name: string;
+  kind: AssetKind;
+  description: string;
+  tags: string[];
+  prompt_hint: string;
+  control: AssetControl;
+  file_name?: string | null;
+  mime_type?: string | null;
+  has_file: boolean;
+  created_at: string;
+  updated_at: string;
 };
 
 type ApiState = "connecting" | "online" | "offline";
@@ -103,11 +128,38 @@ const WORKFLOW_STEPS = [
 ];
 
 const WORKFLOW_CARDS = [
-  { name: "H3 单镜头", type: "I2VA · 推荐", color: "violet", desc: "参考图锁定主体，生成带原生立体声的连续镜头。" },
-  { name: "LTX 长镜头实验", type: "T2V · 15s+", color: "blue", desc: "用于连续运动、空间探索和时序稳定性测试。" },
-  { name: "SeedVR2 发布增强", type: "Upscale · 2.5×", color: "amber", desc: "保留干净母版，输出高分辨率发布分支。" },
-  { name: "证据带复古分支", type: "ntsc-rs · Optional", color: "green", desc: "添加克制的磁带、复合视频与扫描线质感。" },
+  { name: "H3 单镜头", type: "I2VA · 推荐", color: "violet", desc: "参考图锁定主体，生成带原生立体声的连续镜头。", status: "本机模型就绪 · 待导入 JSON", statusTone: "local" },
+  { name: "H3 Motion Context 长视频", type: "FL2VA · Experimental", color: "green", desc: "用前一段的潜空间和原生音频续写下一段；节点已安装，仍需真实 GPU 验证和父子任务编排。", status: "社区节点 · 未生产验证", statusTone: "experimental" },
+  { name: "LTX 长镜头实验", type: "T2V · 15s+", color: "blue", desc: "用于连续运动、空间探索和时序稳定性测试。", status: "流程说明", statusTone: "planned" },
+  { name: "SeedVR2 发布增强", type: "Upscale · 2.5×", color: "amber", desc: "保留干净母版，输出高分辨率发布分支。", status: "待接入 API JSON", statusTone: "planned" },
+  { name: "证据带复古分支", type: "ntsc-rs · Optional", color: "green", desc: "添加克制的磁带、复合视频与扫描线质感。", status: "可选发布分支", statusTone: "local" },
 ];
+
+const ASSET_KINDS: Array<{ id: AssetKind; label: string; icon: LucideIcon }> = [
+  { id: "character", label: "角色", icon: UserRound },
+  { id: "scene", label: "场景", icon: ImageIcon },
+  { id: "style", label: "风格", icon: Palette },
+  { id: "prop", label: "道具", icon: PackageOpen },
+  { id: "audio", label: "音频", icon: AudioLines },
+  { id: "custom", label: "自定义", icon: Boxes },
+];
+
+const ASSET_CONTROL_LABELS: Record<AssetControl, string> = {
+  identity: "身份一致性",
+  scene: "场景参考",
+  style: "风格参考",
+  prop: "道具参考",
+  audio: "声音参考",
+  reference: "通用参考",
+};
+
+function assetKindLabel(kind: AssetKind) {
+  return ASSET_KINDS.find((item) => item.id === kind)?.label ?? "自定义";
+}
+
+function assetKindIcon(kind: AssetKind) {
+  return ASSET_KINDS.find((item) => item.id === kind)?.icon ?? Boxes;
+}
 
 function classNames(...values: Array<string | false | null | undefined>) {
   return values.filter(Boolean).join(" ");
@@ -153,6 +205,8 @@ export function FrameFoundryConsole() {
   const [apiState, setApiState] = useState<ApiState>("connecting");
   const [nodes, setNodes] = useState<PipelineNode[]>(DEFAULT_NODES);
   const [jobs, setJobs] = useState<Job[]>([]);
+  const [assets, setAssets] = useState<Asset[]>([]);
+  const [selectedAssetIds, setSelectedAssetIds] = useState<string[]>([]);
   const [prompt, setPrompt] = useState(
     "一只橘猫在无尽的荧光灯走廊中谨慎前行，低机位跟拍，空气中有轻微尘埃，环境压抑但不恐怖，连续单镜头。",
   );
@@ -169,21 +223,33 @@ export function FrameFoundryConsole() {
   const [queueFilter, setQueueFilter] = useState<"all" | JobState>("all");
   const [searchTerm, setSearchTerm] = useState("");
 
+  const refreshAssets = useCallback(async () => {
+    const response = await fetch(`${API_BASE}/assets`, { cache: "no-store" });
+    if (!response.ok) throw new Error("asset request was not successful");
+    const payload = (await response.json()) as { assets: Asset[] };
+    setAssets(payload.assets);
+    setSelectedAssetIds((current) => current.filter((id) => payload.assets.some((asset) => asset.id === id)));
+  }, []);
+
   const fetchRuntime = useCallback(async () => {
     setApiState("connecting");
     try {
-      const [healthResponse, nodeResponse, jobsResponse] = await Promise.all([
+      const [healthResponse, nodeResponse, jobsResponse, assetsResponse] = await Promise.all([
         fetch(`${API_BASE}/health`, { cache: "no-store" }),
         fetch(`${API_BASE}/nodes`, { cache: "no-store" }),
         fetch(`${API_BASE}/jobs`, { cache: "no-store" }),
+        fetch(`${API_BASE}/assets`, { cache: "no-store" }),
       ]);
-      if (!healthResponse.ok || !nodeResponse.ok || !jobsResponse.ok) {
+      if (!healthResponse.ok || !nodeResponse.ok || !jobsResponse.ok || !assetsResponse.ok) {
         throw new Error("API response was not successful");
       }
       const nodePayload = (await nodeResponse.json()) as { nodes: PipelineNode[] };
       const jobsPayload = (await jobsResponse.json()) as { jobs: Job[] };
+      const assetsPayload = (await assetsResponse.json()) as { assets: Asset[] };
       setNodes(nodePayload.nodes);
       setJobs(jobsPayload.jobs);
+      setAssets(assetsPayload.assets);
+      setSelectedAssetIds((current) => current.filter((id) => assetsPayload.assets.some((asset) => asset.id === id)));
       setApiState("online");
     } catch {
       setApiState("offline");
@@ -278,6 +344,7 @@ export function FrameFoundryConsole() {
           "duration_seconds",
           "resolution",
           "reference_path",
+          "reference_paths",
           "output_dir",
           "job_id",
         ]);
@@ -309,6 +376,7 @@ export function FrameFoundryConsole() {
           reference_name: reference?.name ?? null,
           reference_mime: reference?.type ?? null,
           reference_data: referenceData,
+          asset_ids: selectedAssetIds,
         }),
       });
       if (!response.ok) throw new Error("create job failed");
@@ -333,6 +401,14 @@ export function FrameFoundryConsole() {
     } catch {
       setNotice("取消失败，请检查 API 状态。");
     }
+  }
+
+  function toggleAsset(assetId: string) {
+    setSelectedAssetIds((current) =>
+      current.includes(assetId)
+        ? current.filter((id) => id !== assetId)
+        : [...current, assetId].slice(-20),
+    );
   }
 
   return (
@@ -446,13 +522,25 @@ export function FrameFoundryConsole() {
               submitJob={submitJob}
               refresh={fetchRuntime}
               openSection={setSection}
+              assets={assets}
+              selectedAssetIds={selectedAssetIds}
+              toggleAsset={toggleAsset}
             />
           ) : null}
           {section === "queue" ? (
             <QueueView jobs={filteredJobs} filter={queueFilter} setFilter={setQueueFilter} cancelJob={cancelJob} openCreate={() => setSection("create")} />
           ) : null}
           {section === "workflows" ? <WorkflowView openCreate={() => setSection("create")} /> : null}
-          {section === "assets" ? <AssetsView jobs={jobs} openCreate={() => setSection("create")} announce={setNotice} /> : null}
+          {section === "assets" ? (
+            <AssetsView
+              assets={assets}
+              selectedAssetIds={selectedAssetIds}
+              toggleAsset={toggleAsset}
+              openCreate={() => setSection("create")}
+              refreshAssets={refreshAssets}
+              announce={setNotice}
+            />
+          ) : null}
           {section === "nodes" ? <NodesView nodes={nodes} apiState={apiState} refresh={fetchRuntime} /> : null}
         </div>
       </main>
@@ -491,10 +579,14 @@ type CreateViewProps = {
   submitJob: () => void;
   refresh: () => void;
   openSection: (section: Section) => void;
+  assets: Asset[];
+  selectedAssetIds: string[];
+  toggleAsset: (assetId: string) => void;
 };
 
 function CreateView(props: CreateViewProps) {
   const onlinePercent = Math.round((props.onlineNodes / Math.max(props.nodes.length, 1)) * 100);
+  const selectedAssets = props.assets.filter((asset) => props.selectedAssetIds.includes(asset.id));
   return (
     <>
       <section className="page-heading">
@@ -577,6 +669,24 @@ function CreateView(props: CreateViewProps) {
                 {props.workflowFile ? <button type="button" className="file-clear" onClick={() => props.setWorkflowFile(null)} aria-label="移除工作流"><X size={15} /></button> : null}
               </div>
             </div>
+            <div className="field full-field linked-assets-field">
+              <span>资产中心 <em>Reusable assets</em><b>{selectedAssets.length}/20</b></span>
+              <div className="linked-assets-row">
+                <div className="asset-chip-list">
+                  {selectedAssets.length ? selectedAssets.map((asset) => {
+                    const Icon = assetKindIcon(asset.kind);
+                    return (
+                      <button key={asset.id} type="button" className="asset-chip" onClick={() => props.toggleAsset(asset.id)} title="点击移除">
+                        <Icon size={13} />
+                        <span>{asset.name}</span>
+                        <X size={12} />
+                      </button>
+                    );
+                  }) : <span className="asset-chip-empty">尚未选择可复用资产；多参考任务可一次加入多个角色、场景或风格。</span>}
+                </div>
+                <button type="button" className="secondary-button asset-browse-button" onClick={() => props.openSection("assets")}><FolderOpen size={15} />浏览资产</button>
+              </div>
+            </div>
             <label className="field"><span>输出尺寸 <em>Resolution</em></span><select value={props.resolution} onChange={(event) => props.setResolution(event.target.value)}><option>768P</option><option>1080P</option><option>512P 实验</option></select></label>
             <label className="field"><span>时长 <em>Duration</em></span><div className="input-suffix"><input type="number" min="3" max="30" value={props.duration} onChange={(event) => props.setDuration(event.target.value)} /><b>秒</b></div></label>
             <label className="field"><span>随机种子 <em>Seed</em></span><input value={props.seed} onChange={(event) => props.setSeed(event.target.value)} /></label>
@@ -648,12 +758,205 @@ function QueueView({ jobs, filter, setFilter, cancelJob, openCreate }: { jobs: J
 }
 
 function WorkflowView({ openCreate }: { openCreate: () => void }) {
-  return <><SectionHeading eyebrow="PIPELINE LIBRARY" title="工作流模板" description="把模型调用、增强与质检组合成可重复的生产线。" action={<button className="primary-button" onClick={openCreate}><Play size={16} />使用模板</button>} /><div className="workflow-grid">{WORKFLOW_CARDS.map((card, index) => <article className="workflow-card" key={card.name}><div className={`workflow-preview ${card.color}`}><span>0{index + 1}</span><Boxes size={28} /></div><div className="workflow-body"><span className="workflow-type">{card.type}</span><h3>{card.name}</h3><p>{card.desc}</p><div className="workflow-footer"><span><Check size={14} />已校验</span><button onClick={openCreate}>开始使用</button></div></div></article>)}</div></>;
+  return <><SectionHeading eyebrow="PIPELINE LIBRARY" title="工作流模板" description="把模型调用、增强与质检组合成可重复的生产线；状态只表示当前本机接入事实。" action={<button className="primary-button" onClick={openCreate}><Play size={16} />前往创作台</button>} /><div className="workflow-grid">{WORKFLOW_CARDS.map((card, index) => <article className="workflow-card" key={card.name}><div className={`workflow-preview ${card.color}`}><span>0{index + 1}</span><Boxes size={28} /></div><div className="workflow-body"><span className="workflow-type">{card.type}</span><h3>{card.name}</h3><p>{card.desc}</p><div className="workflow-footer"><span className={card.statusTone}><Activity size={14} />{card.status}</span><button onClick={openCreate}>配置任务</button></div></div></article>)}</div></>;
 }
 
-function AssetsView({ jobs, openCreate, announce }: { jobs: Job[]; openCreate: () => void; announce: (message: string) => void }) {
-  const outputs = jobs.filter((job) => job.status === "completed" && job.output_path);
-  return <><SectionHeading eyebrow="LOCAL LIBRARY" title="素材与产物" description="所有素材都保留在本机；界面只展示已登记的文件。" action={<button className="secondary-button" onClick={() => announce("产物默认保存在项目 data/outputs 目录。") }><FolderOpen size={16} />查看目录位置</button>} /><section className="panel view-panel">{outputs.length ? <div className="asset-grid">{outputs.map((job) => <article className="asset-card" key={job.id}><div className="asset-preview"><Film size={28} /><span>{job.resolution}</span></div><strong>{job.name}</strong><span>{job.output_path}</span></article>)}</div> : <EmptyState icon={Archive} title="还没有可交付产物" description="任务完成并通过 QC 后，输出文件会登记在这里。" action="创建第一个任务" onAction={openCreate} />}</section></>;
+type AssetsViewProps = {
+  assets: Asset[];
+  selectedAssetIds: string[];
+  toggleAsset: (assetId: string) => void;
+  openCreate: () => void;
+  refreshAssets: () => Promise<void>;
+  announce: (message: string) => void;
+};
+
+function AssetsView({ assets, selectedAssetIds, toggleAsset, openCreate, refreshAssets, announce }: AssetsViewProps) {
+  const [filter, setFilter] = useState<"all" | AssetKind>("all");
+  const [query, setQuery] = useState("");
+  const [sort, setSort] = useState<"newest" | "oldest" | "name">("newest");
+  const [layout, setLayout] = useState<"grid" | "list">("grid");
+  const [showComposer, setShowComposer] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [draftName, setDraftName] = useState("");
+  const [draftKind, setDraftKind] = useState<AssetKind>("character");
+  const [draftControl, setDraftControl] = useState<AssetControl>("identity");
+  const [draftDescription, setDraftDescription] = useState("");
+  const [draftPromptHint, setDraftPromptHint] = useState("");
+  const [draftTags, setDraftTags] = useState("");
+  const [draftFile, setDraftFile] = useState<File | null>(null);
+
+  const visibleAssets = useMemo(() => {
+    const normalizedQuery = query.trim().toLocaleLowerCase("zh-CN");
+    return assets
+      .filter((asset) => filter === "all" || asset.kind === filter)
+      .filter((asset) => !normalizedQuery || `${asset.name} ${asset.description} ${asset.tags.join(" ")}`.toLocaleLowerCase("zh-CN").includes(normalizedQuery))
+      .sort((left, right) => {
+        if (sort === "name") return left.name.localeCompare(right.name, "zh-CN");
+        const direction = sort === "newest" ? -1 : 1;
+        return direction * left.created_at.localeCompare(right.created_at);
+      });
+  }, [assets, filter, query, sort]);
+
+  function resetComposer() {
+    setDraftName("");
+    setDraftKind("character");
+    setDraftControl("identity");
+    setDraftDescription("");
+    setDraftPromptHint("");
+    setDraftTags("");
+    setDraftFile(null);
+    setShowComposer(false);
+  }
+
+  async function saveAsset() {
+    if (!draftName.trim()) {
+      announce("请先填写资产名称。");
+      return;
+    }
+    if (draftFile && draftFile.size > 20 * 1024 * 1024) {
+      announce("资产文件超过 20 MB 限制。");
+      return;
+    }
+    setSaving(true);
+    try {
+      const response = await fetch(`${API_BASE}/assets`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: draftName.trim(),
+          kind: draftKind,
+          description: draftDescription.trim(),
+          tags: draftTags.split(/[，,]/).map((tag) => tag.trim()).filter(Boolean),
+          prompt_hint: draftPromptHint.trim(),
+          control: draftControl,
+          file_name: draftFile?.name ?? null,
+          mime_type: draftFile?.type ?? null,
+          file_data: draftFile ? await fileToBase64(draftFile) : null,
+        }),
+      });
+      if (!response.ok) throw new Error("create asset failed");
+      await refreshAssets();
+      resetComposer();
+      announce("资产已保存到本地资产中心。");
+    } catch {
+      announce("资产保存失败，请检查文件类型和本地 API 日志。");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function importAssetPack(file: File | null) {
+    if (!file) return;
+    try {
+      const payload = JSON.parse(await file.text()) as Record<string, unknown>;
+      const response = await fetch(`${API_BASE}/assets/import`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      if (!response.ok) throw new Error("import asset pack failed");
+      const result = (await response.json()) as { imported_count: number; pack_name: string };
+      await refreshAssets();
+      announce(`资产包“${result.pack_name}”已导入 ${result.imported_count} 项。`);
+    } catch {
+      announce("资产包导入失败；请选择符合 FFAI 1.0 资产包格式的 JSON。");
+    }
+  }
+
+  function changeKind(kind: AssetKind) {
+    const controlByKind: Record<AssetKind, AssetControl> = {
+      character: "identity",
+      scene: "scene",
+      style: "style",
+      prop: "prop",
+      audio: "audio",
+      custom: "reference",
+    };
+    setDraftKind(kind);
+    setDraftControl(controlByKind[kind]);
+  }
+
+  return (
+    <>
+      <SectionHeading
+        eyebrow="LOCAL ASSET CENTER"
+        title="资产中心"
+        description="沉淀可复用的角色、场景、风格包、道具和声音，并直接加入本地 H3 创作。"
+        action={(
+          <>
+            <input id="asset-pack-file" className="visually-hidden" type="file" accept="application/json,.json" onChange={(event) => { void importAssetPack(event.target.files?.[0] ?? null); event.currentTarget.value = ""; }} />
+            <label htmlFor="asset-pack-file" className="secondary-button"><Upload size={16} />导入资产包</label>
+            <button className="primary-button" onClick={() => setShowComposer((current) => !current)}><Plus size={17} />添加资产</button>
+          </>
+        )}
+      />
+
+      {showComposer ? (
+        <section className="panel asset-composer" aria-label="添加资产">
+          <div className="asset-composer-heading">
+            <div><span className="panel-kicker">NEW REUSABLE ASSET</span><h2><Plus size={18} />添加本地资产</h2></div>
+            <button className="icon-button small" onClick={resetComposer} aria-label="关闭资产编辑器"><X size={15} /></button>
+          </div>
+          <div className="asset-form-grid">
+            <label className="field"><span>资产名称 <em>Name</em></span><input value={draftName} onChange={(event) => setDraftName(event.target.value)} placeholder="例如：橘猫主角 · 正面参考" /></label>
+            <label className="field"><span>资产分类 <em>Category</em></span><select value={draftKind} onChange={(event) => changeKind(event.target.value as AssetKind)}>{ASSET_KINDS.map((kind) => <option key={kind.id} value={kind.id}>{kind.label}</option>)}</select></label>
+            <label className="field"><span>控制用途 <em>H3 control</em></span><select value={draftControl} onChange={(event) => setDraftControl(event.target.value as AssetControl)}>{Object.entries(ASSET_CONTROL_LABELS).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+            <label className="field full-field"><span>简介 <em>Description</em></span><input value={draftDescription} onChange={(event) => setDraftDescription(event.target.value)} placeholder="说明这个资产适合在哪些镜头中使用" /></label>
+            <label className="field full-field"><span>提示词片段 <em>Prompt hint</em></span><textarea value={draftPromptHint} onChange={(event) => setDraftPromptHint(event.target.value)} placeholder="可选：锁定外观、材质、光线或声音特征的提示词" /></label>
+            <label className="field"><span>标签 <em>Tags</em></span><input value={draftTags} onChange={(event) => setDraftTags(event.target.value)} placeholder="角色，橘猫，主角" /></label>
+            <div className="field asset-file-field"><span>本地文件 <em>File</em></span><input id="asset-source-file" className="visually-hidden" type="file" accept="image/*,video/*,audio/*,.json" onChange={(event) => setDraftFile(event.target.files?.[0] ?? null)} /><label htmlFor="asset-source-file" className={classNames("upload-zone", draftFile && "has-file")}><Upload size={19} /><span><strong>{draftFile?.name ?? "选择参考文件"}</strong><small>{draftFile ? "点击重新选择" : "图片、视频、音频或 JSON · 最大 20 MB"}</small></span></label></div>
+          </div>
+          <div className="asset-composer-actions"><button className="secondary-button" onClick={resetComposer}>取消</button><button className="primary-button" disabled={saving} onClick={() => { void saveAsset(); }}>{saving ? <LoaderCircle className="spin" size={16} /> : <Check size={16} />}{saving ? "正在保存…" : "保存资产"}</button></div>
+        </section>
+      ) : null}
+
+      <section className="panel view-panel asset-center-panel">
+        <div className="asset-toolbar">
+          <div className="asset-category-tabs">
+            <button className={filter === "all" ? "active" : ""} onClick={() => setFilter("all")}>所有类型 <b>{assets.length}</b></button>
+            {ASSET_KINDS.map((kind) => {
+              const Icon = kind.icon;
+              const count = assets.filter((asset) => asset.kind === kind.id).length;
+              return <button key={kind.id} className={filter === kind.id ? "active" : ""} onClick={() => setFilter(kind.id)}><Icon size={14} />{kind.label}{count ? <b>{count}</b> : null}</button>;
+            })}
+          </div>
+          <div className="asset-tools">
+            <label className="asset-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索资产…" /></label>
+            <select aria-label="资产排序" value={sort} onChange={(event) => setSort(event.target.value as "newest" | "oldest" | "name")}><option value="newest">最近更新</option><option value="oldest">最早添加</option><option value="name">名称排序</option></select>
+            <div className="asset-layout-switch" aria-label="资产布局"><button aria-label="网格布局" className={layout === "grid" ? "active" : ""} onClick={() => setLayout("grid")}><Grid2X2 size={16} /></button><button aria-label="列表布局" className={layout === "list" ? "active" : ""} onClick={() => setLayout("list")}><List size={17} /></button></div>
+          </div>
+        </div>
+
+        {visibleAssets.length ? (
+          <div className={classNames("asset-grid", layout === "list" && "list-layout")}>
+            {visibleAssets.map((asset) => {
+              const Icon = assetKindIcon(asset.kind);
+              const selected = selectedAssetIds.includes(asset.id);
+              const isImage = asset.mime_type?.startsWith("image/") && asset.has_file;
+              return (
+                <article className={classNames("asset-card", selected && "selected")} key={asset.id}>
+                  <div className={classNames("asset-preview", `kind-${asset.kind}`)}>
+                    {isImage ? <div className="asset-image" role="img" aria-label={asset.name} style={{ backgroundImage: `url(${API_BASE}/assets/${encodeURIComponent(asset.id)}/content)` }} /> : <Icon size={30} />}
+                    <span>{assetKindLabel(asset.kind)}</span>
+                    {selected ? <i className="asset-selected-mark"><Check size={13} /></i> : null}
+                  </div>
+                  <div className="asset-card-body">
+                    <div><strong>{asset.name}</strong><small>{ASSET_CONTROL_LABELS[asset.control]}</small></div>
+                    <p>{asset.description || asset.file_name || "本地可复用资产"}</p>
+                    {asset.tags.length ? <div className="asset-tags">{asset.tags.slice(0, 3).map((tag) => <span key={tag}>#{tag}</span>)}</div> : null}
+                    <button className={selected ? "asset-use-button selected" : "asset-use-button"} onClick={() => toggleAsset(asset.id)}>{selected ? <><X size={13} />移出创作</> : <><Plus size={13} />加入创作</>}</button>
+                  </div>
+                </article>
+              );
+            })}
+          </div>
+        ) : (
+          <EmptyState icon={Archive} title={assets.length ? "没有匹配的资产" : "还没有任何资产"} description={assets.length ? "调整分类或搜索词，找到要复用的角色、场景或风格。" : "点击右上角添加资产，或导入 FFAI JSON 资产包。"} action={assets.length ? "清除筛选" : "添加第一个资产"} onAction={() => { if (assets.length) { setFilter("all"); setQuery(""); } else { setShowComposer(true); } }} />
+        )}
+        {selectedAssetIds.length ? <div className="asset-selection-bar"><span><Check size={15} />已选择 {selectedAssetIds.length} 个资产，可通过 <code>{"{{reference_paths}}"}</code> 传给 H3</span><button className="primary-button" onClick={openCreate}><Play size={15} />返回创作台</button></div> : null}
+      </section>
+    </>
+  );
 }
 
 function NodesView({ nodes, apiState, refresh }: { nodes: PipelineNode[]; apiState: ApiState; refresh: () => void }) {
