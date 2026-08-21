@@ -37,6 +37,34 @@ UPLOAD_DIR = Path(
 ASSET_DIR = Path(
     os.getenv("FRAMEFOUNDRY_ASSET_DIR", DATA_DIR / "assets")
 ).resolve()
+
+
+def _configured_paths(key: str) -> tuple[Path, ...]:
+    raw = os.getenv(key, "")
+    if not raw.strip():
+        return ()
+    return tuple(
+        Path(value.strip()).resolve()
+        for value in raw.split(os.pathsep)
+        if value.strip()
+    )
+
+
+_extra_library_roots = _configured_paths("FRAMEFOUNDRY_LIBRARY_ROOTS")
+LIBRARY_ROOTS = tuple(dict.fromkeys((OUTPUT_DIR, *_extra_library_roots)))
+_history_database = os.getenv("FRAMEFOUNDRY_HISTORY_DATABASE", "").strip()
+HISTORY_DATABASE_PATH = Path(_history_database).resolve() if _history_database else None
+NODE_OUTPUT_DIRS = {
+    node_id: Path(value).resolve()
+    for node_id, value in {
+        "ltx": os.getenv("FRAMEFOUNDRY_LTX_OUTPUT_DIR", ""),
+        "h3": os.getenv("FRAMEFOUNDRY_H3_OUTPUT_DIR", ""),
+        "seedvr": os.getenv("FRAMEFOUNDRY_SEEDVR_OUTPUT_DIR", ""),
+        "ntsc": os.getenv("FRAMEFOUNDRY_NTSC_OUTPUT_DIR", ""),
+        "music": os.getenv("FRAMEFOUNDRY_MUSIC_OUTPUT_DIR", ""),
+    }.items()
+    if value.strip()
+}
 REAL_JOB_TIMEOUT_SECONDS = int(
     os.getenv("FRAMEFOUNDRY_REAL_JOB_TIMEOUT_SECONDS", "3600")
 )
@@ -80,5 +108,10 @@ NODES = (
 
 
 def prepare_directories() -> None:
-    for directory in (DATA_DIR, OUTPUT_DIR, UPLOAD_DIR, ASSET_DIR):
+    for directory in (
+        DATA_DIR,
+        OUTPUT_DIR,
+        UPLOAD_DIR,
+        ASSET_DIR,
+    ):
         directory.mkdir(parents=True, exist_ok=True)

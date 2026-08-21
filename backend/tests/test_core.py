@@ -113,6 +113,100 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(created["asset_ids"], ["asset-1"])
             self.assertEqual(store.asset_paths(["asset-1"]), [asset["file_path"]])
 
+    def test_night_run_review_gate_and_circuit_breaker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "test.db")
+            store.initialize()
+            night_run = store.create_night_run(
+                {
+                    "id": "night-1",
+                    "name": "夜间校准",
+                    "objective": "先样片，后扩产",
+                    "topics": ["池核", "阈限空间"],
+                    "must_have": ["自然手持"],
+                    "forbidden": ["重复画面"],
+                    "max_previews": 3,
+                    "max_finals": 1,
+                    "max_consecutive_failures": 2,
+                }
+            )
+            self.assertEqual(night_run["status"], "active")
+            for index in range(2):
+                job_id = f"preview-{index}"
+                store.create(
+                    {
+                        "id": job_id,
+                        "name": "校准样片",
+                        "prompt": "自然手持穿过池房",
+                        "mode": "I2VA",
+                        "resolution": "512P",
+                        "duration_seconds": 5,
+                        "simulated": True,
+                        "night_run_id": "night-1",
+                        "production_stage": "preview",
+                    }
+                )
+                store.update(job_id, status="completed", progress=100, stage="样片完成")
+                reviewed = store.review_preview(job_id, "reject", ["动作错误"])
+                self.assertEqual(reviewed["review_status"], "rejected")
+
+            paused = store.get_night_run("night-1")
+            self.assertEqual(paused["status"], "paused")
+            self.assertEqual(paused["consecutive_failures"], 2)
+            self.assertEqual(paused["rejected_count"], 2)
+            self.assertIsNone(store.next_queued())
+
+    def test_library_prefers_rich_metadata_and_supports_updates(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video_path = root / "clip.mp4"
+            video_path.write_bytes(b"fake-video")
+            store = JobStore(root / "test.db")
+            store.initialize()
+            store.upsert_library_item(
+                {
+                    "id": "clip-1",
+                    "source_kind": "history",
+                    "source_key": "history:batch:clip",
+                    "name": "有记录的成片",
+                    "batch_name": "batch",
+                    "file_path": str(video_path),
+                    "file_name": video_path.name,
+                    "size_bytes": video_path.stat().st_size,
+                    "modified_at": "2026-08-01T00:00:00+00:00",
+                    "prompt": "穿过明亮的阈限空间",
+                    "stage": "enhanced",
+                    "qc_status": "pass",
+                    "metadata_quality": "complete",
+                    "variants": [
+                        {"kind": "enhanced", "label": "高清", "path": str(video_path)}
+                    ],
+                }
+            )
+            store.upsert_library_item(
+                {
+                    "id": "clip-duplicate",
+                    "source_kind": "discovered",
+                    "source_key": "file:duplicate",
+                    "name": "只有文件名",
+                    "file_path": str(video_path),
+                    "modified_at": "2026-08-02T00:00:00+00:00",
+                    "metadata_quality": "filename_only",
+                }
+            )
+            items, total = store.list_library_items(query="阈限", stage="enhanced")
+            self.assertEqual(total, 1)
+            self.assertEqual(items[0]["name"], "有记录的成片")
+            self.assertTrue(items[0]["playable"])
+            updated = store.update_library_item(
+                "clip-1", {"qc_status": "selected", "tags": ["收藏", "竖屏"]}
+            )
+            self.assertEqual(updated["qc_status"], "selected")
+            self.assertEqual(updated["tags"], ["收藏", "竖屏"])
+            summary = store.library_summary()
+            self.assertEqual(summary["total"], 1)
+            self.assertEqual(summary["with_prompt"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()

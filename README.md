@@ -19,6 +19,10 @@
 当前版本：`v1.0.0`。这是独立项目，不是 MoneyPrinterTurbo 的分支，也不包含任何模型权重。
 
 > 本地开发版已加入资产中心：角色、场景、风格、道具、音频与自定义资产可登记、预览、导入并加入生成任务。
+>
+> `1.1` 开发分支已加入“守夜监制”MVP：过夜计划先生成低成本样片，人工通过后才允许创建正式任务；样片/正式片预算、截止时间和连续失败熔断由本地控制 API 强制执行。
+>
+> 本地开发版同时加入“成片库”：已同步的旧片和今后的新片可以直接预览，并关联提示词、参考素材、生成阶段、版本与 QC 结论；旧文件保持原位。
 
 ## 1.0 已实现
 
@@ -128,6 +132,23 @@ data/
 `.env`、数据库、上传素材、产物、虚拟环境和运行日志都已加入 `.gitignore`，不会进入后续
 GitHub 仓库。
 
+## 成片库与历史视频
+
+成片库采用两条互不阻塞的归档路径：
+
+- **今后的新片**：当任务产物能解析为允许目录中的本地视频时，自动保存任务名、提示词、模式、Seed、参考素材、守夜阶段和审核结论。
+- **过去的旧片**：优先只读同步既有 `video_generation_history.sqlite3`；没有生产记录的文件只在用户点击“发现最近旧片”后按需登记，并明确标为“待补资料”。
+
+系统不会移动、重命名或复制旧视频。播放接口只能读取 `.env` 明确配置的目录，浏览器请求不能提交任意本机路径。Windows 下多个目录使用分号分隔：
+
+```text
+FRAMEFOUNDRY_LIBRARY_ROOTS=C:/AI-Videos/production;D:/Old-Renders
+FRAMEFOUNDRY_HISTORY_DATABASE=C:/AI-Videos/production/video_generation_history.sqlite3
+FRAMEFOUNDRY_H3_OUTPUT_DIR=C:/AI/ComfyUI-H3/ComfyUI/output
+```
+
+历史记录无法恢复的提示词或素材不会被猜测成事实，可以稍后在成片详情中补录片名、提示词、标签、审核状态和复盘评价。
+
 ## API
 
 | 方法 | 地址 | 用途 |
@@ -143,6 +164,20 @@ GitHub 仓库。
 | `POST` | `/api/assets` | 新增角色、场景、风格等资产 |
 | `POST` | `/api/assets/import` | 导入 JSON 资产包 |
 | `GET` | `/api/assets/{id}/content` | 预览本地资产文件 |
+| `GET` | `/api/library` | 搜索、筛选和分页读取成片记录 |
+| `GET` | `/api/library/{id}/content` | 播放已登记且位于允许目录中的视频 |
+| `PATCH` | `/api/library/{id}` | 补录片名、提示词、标签与 QC 评价 |
+| `POST` | `/api/library/sync` | 只读同步历史数据库或按需发现旧片 |
+| `GET` | `/api/night-runs` | 获取守夜计划与审片统计 |
+| `POST` | `/api/night-runs` | 创建带预算、规则和熔断阈值的守夜计划 |
+| `POST` | `/api/night-runs/{id}/status` | 暂停、恢复或结束守夜计划 |
+| `POST` | `/api/jobs/{id}/review` | 通过或拒绝已完成的夜班样片 |
+
+## 守夜监制 MVP
+
+守夜计划把任务分为 `preview` 与 `final` 两个阶段。`final` 必须关联同一计划中已经人工通过的 `preview`，因此一条方向错误的低清样片不会自动进入高清或后处理。计划达到样片/正式片上限后拒绝继续创建；连续拒绝达到阈值后自动暂停，暂停计划中的排队任务不会被调度。
+
+当前 MVP 提供的是可靠的人工审核门、预算和熔断器，不会把“AI 审美评分”伪装成已经完成。重复画面检测、技术视频 QC、语义检查和 H3 → SeedVR2 → ntsc-rs 多节点自动串联仍属于后续版本。
 
 ## 验证
 
@@ -161,7 +196,7 @@ SQLite 生命周期和异常中断恢复。
 - 浏览器上传的参考文件会保存到本机；ComfyUI 必须能访问替换后的 `reference_path`。
 - 取消已提交的真实任务只停止 FrameFoundry 的跟踪，不会调用 ComfyUI 的全局 `/interrupt`，
   以免误停其他任务。
-- 真实跨节点超分、ntsc-rs 后期、自动 QC、WebSocket 实时进度与视频预览计划放到 1.1+。
+- 真实跨节点超分、ntsc-rs 后期、自动语义 QC、WebSocket 实时进度与视频预览计划放到后续版本。
 
 ## 项目结构
 

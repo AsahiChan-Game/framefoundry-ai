@@ -23,6 +23,8 @@ test("server-renders the FrameFoundry AI console", async () => {
   assert.match(html, /把灵感锻造成每一帧/);
   assert.match(html, /本地节点/);
   assert.match(html, /安全模拟/);
+  assert.match(html, /守夜监制/);
+  assert.match(html, /成片库/);
   assert.doesNotMatch(html, /codex-preview/);
   assert.doesNotMatch(html, /react-loading-skeleton/);
 });

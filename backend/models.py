@@ -6,10 +6,16 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 JobStatus = Literal["queued", "running", "completed", "failed", "cancelled"]
+ProductionStage = Literal["manual", "preview", "final"]
+ReviewStatus = Literal["not_required", "needs_review", "passed", "rejected"]
+NightRunStatus = Literal["active", "paused", "completed", "cancelled"]
 AssetKind = Literal["character", "scene", "style", "prop", "audio", "custom"]
 AssetControl = Literal[
     "identity", "scene", "style", "prop", "audio", "reference"
 ]
+LibrarySourceKind = Literal["managed", "history", "discovered"]
+LibraryStage = Literal["preview", "raw", "enhanced", "release", "unknown"]
+LibraryMetadataQuality = Literal["complete", "partial", "filename_only"]
 
 
 class AssetCreate(BaseModel):
@@ -83,6 +89,9 @@ class JobCreate(BaseModel):
     reference_mime: str | None = Field(default=None, max_length=120)
     reference_data: str | None = None
     asset_ids: list[str] = Field(default_factory=list, max_length=20)
+    night_run_id: str | None = Field(default=None, max_length=32)
+    production_stage: ProductionStage = "manual"
+    parent_job_id: str | None = Field(default=None, max_length=32)
 
     @field_validator("name", "prompt")
     @classmethod
@@ -98,6 +107,16 @@ class JobCreate(BaseModel):
             raise ValueError("真实任务必须提供 ComfyUI API 工作流 JSON")
         if self.reference_data and not self.reference_name:
             raise ValueError("参考素材数据必须带文件名")
+        if self.production_stage != "manual" and not self.night_run_id:
+            raise ValueError("夜班样片或正式任务必须关联守夜计划")
+        if self.production_stage == "final" and not self.parent_job_id:
+            raise ValueError("夜班正式任务必须关联已通过的样片")
+        if self.production_stage != "final" and self.parent_job_id:
+            raise ValueError("只有夜班正式任务可以关联父样片")
+        if self.production_stage == "manual" and (
+            self.night_run_id or self.parent_job_id
+        ):
+            raise ValueError("普通任务不能关联守夜计划或父样片")
         self.asset_ids = list(dict.fromkeys(self.asset_ids))
         return self
 
@@ -122,6 +141,162 @@ class JobResponse(BaseModel):
     output_path: str | None = None
     error: str | None = None
     asset_ids: list[str] = Field(default_factory=list)
+    night_run_id: str | None = None
+    production_stage: ProductionStage = "manual"
+    parent_job_id: str | None = None
+    review_status: ReviewStatus = "not_required"
+    review_reasons: list[str] = Field(default_factory=list)
+
+
+class JobReviewRequest(BaseModel):
+    decision: Literal["pass", "reject"]
+    reasons: list[str] = Field(default_factory=list, max_length=10)
+
+    @field_validator("reasons")
+    @classmethod
+    def normalize_reasons(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            reason = value.strip()
+            if reason and reason not in normalized:
+                normalized.append(reason[:80])
+        return normalized
+
+
+class NightRunCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+    objective: str = Field(min_length=1, max_length=2000)
+    topics: list[str] = Field(default_factory=list, max_length=30)
+    must_have: list[str] = Field(default_factory=list, max_length=30)
+    should_have: list[str] = Field(default_factory=list, max_length=30)
+    explore: list[str] = Field(default_factory=list, max_length=30)
+    forbidden: list[str] = Field(default_factory=list, max_length=30)
+    max_previews: int = Field(default=8, ge=1, le=200)
+    max_finals: int = Field(default=4, ge=1, le=100)
+    max_consecutive_failures: int = Field(default=2, ge=1, le=20)
+    cutoff_at: str | None = Field(default=None, max_length=64)
+    fallback_policy: str = Field(default="", max_length=1000)
+
+    @field_validator("name", "objective")
+    @classmethod
+    def strip_night_run_text(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("不能为空")
+        return value
+
+    @field_validator("topics", "must_have", "should_have", "explore", "forbidden")
+    @classmethod
+    def normalize_rule_list(cls, values: list[str]) -> list[str]:
+        normalized: list[str] = []
+        for value in values:
+            rule = value.strip()
+            if rule and rule not in normalized:
+                normalized.append(rule[:160])
+        return normalized
+
+
+class NightRunResponse(BaseModel):
+    id: str
+    name: str
+    objective: str
+    status: NightRunStatus
+    topics: list[str]
+    must_have: list[str]
+    should_have: list[str]
+    explore: list[str]
+    forbidden: list[str]
+    max_previews: int
+    max_finals: int
+    max_consecutive_failures: int
+    consecutive_failures: int
+    cutoff_at: str | None = None
+    fallback_policy: str
+    preview_count: int = 0
+    final_count: int = 0
+    awaiting_review_count: int = 0
+    passed_count: int = 0
+    rejected_count: int = 0
+    created_at: str
+    updated_at: str
+
+
+class NightRunStatusRequest(BaseModel):
+    status: NightRunStatus
+
+
+class LibraryVariant(BaseModel):
+    kind: str
+    label: str
+    path: str
+
+
+class LibraryItemResponse(BaseModel):
+    id: str
+    source_kind: LibrarySourceKind
+    source_key: str
+    job_id: str | None = None
+    name: str
+    batch_name: str
+    file_path: str
+    file_name: str
+    media_type: str
+    size_bytes: int
+    modified_at: str
+    prompt: str
+    mode: str
+    stage: LibraryStage
+    seed: int | None = None
+    width: int | None = None
+    height: int | None = None
+    duration_seconds: float | None = None
+    fps: float | None = None
+    qc_status: str
+    review_notes: str
+    metadata_quality: LibraryMetadataQuality
+    reference_paths: list[str]
+    asset_ids: list[str]
+    variants: list[LibraryVariant]
+    tags: list[str]
+    playable: bool
+    created_at: str
+    updated_at: str
+
+
+class LibraryUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    prompt: str | None = Field(default=None, max_length=16000)
+    stage: LibraryStage | None = None
+    qc_status: str | None = Field(default=None, max_length=40)
+    review_notes: str | None = Field(default=None, max_length=4000)
+    tags: list[str] | None = Field(default=None, max_length=30)
+
+    @field_validator("name", "qc_status")
+    @classmethod
+    def strip_library_short_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("不能为空")
+        return normalized
+
+    @field_validator("tags")
+    @classmethod
+    def normalize_library_tags(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        normalized: list[str] = []
+        for value in values:
+            tag = value.strip()
+            if tag and tag not in normalized:
+                normalized.append(tag[:40])
+        return normalized
+
+
+class LibrarySyncRequest(BaseModel):
+    mode: Literal["history", "files", "all"] = "all"
+    limit: int = Field(default=500, ge=1, le=5000)
 
 
 class WorkflowValidateRequest(BaseModel):
