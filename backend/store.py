@@ -57,7 +57,12 @@ class JobStore:
                     reference_path TEXT,
                     output_path TEXT,
                     error TEXT,
-                    asset_ids_json TEXT NOT NULL DEFAULT '[]'
+                    asset_ids_json TEXT NOT NULL DEFAULT '[]',
+                    night_run_id TEXT,
+                    production_stage TEXT NOT NULL DEFAULT 'manual',
+                    parent_job_id TEXT,
+                    review_status TEXT NOT NULL DEFAULT 'not_required',
+                    review_reasons_json TEXT NOT NULL DEFAULT '[]'
                 )
                 """
             )
@@ -68,6 +73,25 @@ class JobStore:
                 connection.execute(
                     "ALTER TABLE jobs ADD COLUMN asset_ids_json TEXT NOT NULL DEFAULT '[]'"
                 )
+            job_migrations = {
+                "night_run_id": "ALTER TABLE jobs ADD COLUMN night_run_id TEXT",
+                "production_stage": (
+                    "ALTER TABLE jobs ADD COLUMN production_stage "
+                    "TEXT NOT NULL DEFAULT 'manual'"
+                ),
+                "parent_job_id": "ALTER TABLE jobs ADD COLUMN parent_job_id TEXT",
+                "review_status": (
+                    "ALTER TABLE jobs ADD COLUMN review_status "
+                    "TEXT NOT NULL DEFAULT 'not_required'"
+                ),
+                "review_reasons_json": (
+                    "ALTER TABLE jobs ADD COLUMN review_reasons_json "
+                    "TEXT NOT NULL DEFAULT '[]'"
+                ),
+            }
+            for column, statement in job_migrations.items():
+                if column not in job_columns:
+                    connection.execute(statement)
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS assets (
@@ -88,6 +112,37 @@ class JobStore:
             )
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_assets_created_at ON assets(created_at DESC)"
+            )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS night_runs (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    objective TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'active',
+                    topics_json TEXT NOT NULL DEFAULT '[]',
+                    must_have_json TEXT NOT NULL DEFAULT '[]',
+                    should_have_json TEXT NOT NULL DEFAULT '[]',
+                    explore_json TEXT NOT NULL DEFAULT '[]',
+                    forbidden_json TEXT NOT NULL DEFAULT '[]',
+                    max_previews INTEGER NOT NULL DEFAULT 8,
+                    max_finals INTEGER NOT NULL DEFAULT 4,
+                    max_consecutive_failures INTEGER NOT NULL DEFAULT 2,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    cutoff_at TEXT,
+                    fallback_policy TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_night_runs_created_at "
+                "ON night_runs(created_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_jobs_night_run "
+                "ON jobs(night_run_id, production_stage, review_status)"
             )
             connection.commit()
 
@@ -116,6 +171,15 @@ class JobStore:
             "output_path": None,
             "error": None,
             "asset_ids_json": json.dumps(values.get("asset_ids", [])),
+            "night_run_id": values.get("night_run_id"),
+            "production_stage": values.get("production_stage", "manual"),
+            "parent_job_id": values.get("parent_job_id"),
+            "review_status": (
+                "needs_review"
+                if values.get("production_stage") == "preview"
+                else "not_required"
+            ),
+            "review_reasons_json": "[]",
         }
         columns = ", ".join(record)
         placeholders = ", ".join(f":{column}" for column in record)
@@ -145,7 +209,18 @@ class JobStore:
     def next_queued(self) -> dict[str, Any] | None:
         with self._lock, self._connection() as connection:
             row = connection.execute(
-                "SELECT * FROM jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT 1"
+                """
+                SELECT jobs.*
+                FROM jobs
+                LEFT JOIN night_runs ON night_runs.id = jobs.night_run_id
+                WHERE jobs.status = 'queued'
+                  AND (
+                    jobs.night_run_id IS NULL
+                    OR night_runs.status = 'active'
+                  )
+                ORDER BY jobs.created_at ASC
+                LIMIT 1
+                """
             ).fetchone()
         return self._decode(row, include_workflow=True) if row else None
 
@@ -177,6 +252,7 @@ class JobStore:
             "reference_path",
             "output_path",
             "error",
+            "review_status",
         }
         unexpected = set(changes) - allowed
         if unexpected:
@@ -246,13 +322,183 @@ class JobStore:
             if asset.get("file_path")
         ]
 
+    def create_night_run(self, values: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        record = {
+            "id": values["id"],
+            "name": values["name"],
+            "objective": values["objective"],
+            "status": "active",
+            "topics_json": json.dumps(values.get("topics", []), ensure_ascii=False),
+            "must_have_json": json.dumps(
+                values.get("must_have", []), ensure_ascii=False
+            ),
+            "should_have_json": json.dumps(
+                values.get("should_have", []), ensure_ascii=False
+            ),
+            "explore_json": json.dumps(values.get("explore", []), ensure_ascii=False),
+            "forbidden_json": json.dumps(
+                values.get("forbidden", []), ensure_ascii=False
+            ),
+            "max_previews": values.get("max_previews", 8),
+            "max_finals": values.get("max_finals", 4),
+            "max_consecutive_failures": values.get("max_consecutive_failures", 2),
+            "consecutive_failures": 0,
+            "cutoff_at": values.get("cutoff_at"),
+            "fallback_policy": values.get("fallback_policy", ""),
+            "created_at": now,
+            "updated_at": now,
+        }
+        columns = ", ".join(record)
+        placeholders = ", ".join(f":{column}" for column in record)
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                f"INSERT INTO night_runs ({columns}) VALUES ({placeholders})", record
+            )
+            connection.commit()
+        return self.get_night_run(record["id"])
+
+    def get_night_run(self, night_run_id: str) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM night_runs WHERE id = ?", (night_run_id,)
+            ).fetchone()
+            if row is None:
+                raise KeyError(night_run_id)
+            metrics = self._night_run_metrics(connection, night_run_id)
+        return self._decode_night_run(row, metrics)
+
+    def list_night_runs(self, limit: int = 100) -> list[dict[str, Any]]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM night_runs ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+            return [
+                self._decode_night_run(
+                    row, self._night_run_metrics(connection, row["id"])
+                )
+                for row in rows
+            ]
+
+    def update_night_run_status(
+        self, night_run_id: str, status: str
+    ) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                "UPDATE night_runs SET status = ?, updated_at = ? WHERE id = ?",
+                (status, utc_now(), night_run_id),
+            )
+            connection.commit()
+        if cursor.rowcount == 0:
+            raise KeyError(night_run_id)
+        return self.get_night_run(night_run_id)
+
+    def pause_expired_night_runs(self) -> int:
+        now = datetime.now(timezone.utc)
+        expired_ids: list[str] = []
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT id, cutoff_at
+                FROM night_runs
+                WHERE status = 'active' AND cutoff_at IS NOT NULL
+                """
+            ).fetchall()
+            for row in rows:
+                try:
+                    cutoff = datetime.fromisoformat(row["cutoff_at"].replace("Z", "+00:00"))
+                    if cutoff.tzinfo is None:
+                        cutoff = cutoff.replace(tzinfo=timezone.utc)
+                    if cutoff <= now:
+                        expired_ids.append(row["id"])
+                except ValueError:
+                    continue
+            if expired_ids:
+                placeholders = ",".join("?" for _ in expired_ids)
+                connection.execute(
+                    f"UPDATE night_runs SET status = 'paused', updated_at = ? "
+                    f"WHERE id IN ({placeholders})",
+                    (utc_now(), *expired_ids),
+                )
+                connection.commit()
+        return len(expired_ids)
+
+    def review_preview(
+        self, job_id: str, decision: str, reasons: list[str]
+    ) -> dict[str, Any]:
+        review_status = "passed" if decision == "pass" else "rejected"
+        now = utc_now()
+        with self._lock, self._connection() as connection:
+            job = connection.execute(
+                "SELECT * FROM jobs WHERE id = ?", (job_id,)
+            ).fetchone()
+            if job is None:
+                raise KeyError(job_id)
+            if job["production_stage"] != "preview" or job["status"] != "completed":
+                raise ValueError("只有已完成的夜班样片可以审核")
+            if job["review_status"] != "needs_review":
+                raise ValueError("这条样片已经审核，不能重复计入熔断")
+            night_run_id = job["night_run_id"]
+            run = connection.execute(
+                "SELECT * FROM night_runs WHERE id = ?", (night_run_id,)
+            ).fetchone()
+            if run is None:
+                raise ValueError("样片关联的守夜计划不存在")
+            connection.execute(
+                """
+                UPDATE jobs
+                SET review_status = ?, review_reasons_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (review_status, json.dumps(reasons, ensure_ascii=False), now, job_id),
+            )
+            consecutive = 0
+            run_status = run["status"]
+            if decision == "reject":
+                consecutive = run["consecutive_failures"] + 1
+                if consecutive >= run["max_consecutive_failures"]:
+                    run_status = "paused"
+            connection.execute(
+                """
+                UPDATE night_runs
+                SET consecutive_failures = ?, status = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (consecutive, run_status, now, night_run_id),
+            )
+            connection.commit()
+        return self.get(job_id)
+
+    @staticmethod
+    def _night_run_metrics(
+        connection: sqlite3.Connection, night_run_id: str
+    ) -> dict[str, int]:
+        row = connection.execute(
+            """
+            SELECT
+                SUM(CASE WHEN production_stage = 'preview' THEN 1 ELSE 0 END) preview_count,
+                SUM(CASE WHEN production_stage = 'final' THEN 1 ELSE 0 END) final_count,
+                SUM(CASE WHEN review_status = 'needs_review' AND status = 'completed' THEN 1 ELSE 0 END) awaiting_review_count,
+                SUM(CASE WHEN review_status = 'passed' THEN 1 ELSE 0 END) passed_count,
+                SUM(CASE WHEN review_status = 'rejected' THEN 1 ELSE 0 END) rejected_count
+            FROM jobs
+            WHERE night_run_id = ?
+            """,
+            (night_run_id,),
+        ).fetchone()
+        return {key: int(row[key] or 0) for key in row.keys()}
+
     @staticmethod
     def _decode(row: sqlite3.Row, include_workflow: bool = False) -> dict[str, Any]:
         result = dict(row)
         result["simulated"] = bool(result["simulated"])
         workflow_json = result.pop("workflow_json", None)
         asset_ids_json = result.pop("asset_ids_json", "[]")
+        review_reasons_json = result.pop("review_reasons_json", "[]")
         result["asset_ids"] = json.loads(asset_ids_json) if asset_ids_json else []
+        result["review_reasons"] = (
+            json.loads(review_reasons_json) if review_reasons_json else []
+        )
         if include_workflow:
             result["workflow"] = json.loads(workflow_json) if workflow_json else None
         return result
@@ -263,4 +509,15 @@ class JobStore:
         tags_json = result.pop("tags_json", "[]")
         result["tags"] = json.loads(tags_json) if tags_json else []
         result["has_file"] = bool(result.get("file_path"))
+        return result
+
+    @staticmethod
+    def _decode_night_run(
+        row: sqlite3.Row, metrics: dict[str, int]
+    ) -> dict[str, Any]:
+        result = dict(row)
+        for field in ("topics", "must_have", "should_have", "explore", "forbidden"):
+            raw = result.pop(f"{field}_json", "[]")
+            result[field] = json.loads(raw) if raw else []
+        result.update(metrics)
         return result

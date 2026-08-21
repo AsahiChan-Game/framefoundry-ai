@@ -76,6 +76,97 @@ class AssetApiTests(unittest.TestCase):
                 main.store = original_store
                 main.ASSET_DIR = original_asset_dir
 
+    def test_night_run_requires_passed_preview_before_final(self) -> None:
+        original_store = main.store
+        with tempfile.TemporaryDirectory() as directory:
+            main.store = JobStore(Path(directory) / "night-api.db")
+            try:
+                with TestClient(main.app) as client:
+                    run_response = client.post(
+                        "/api/night-runs",
+                        json={
+                            "name": "守夜测试",
+                            "objective": "先验证样片，再进入正式生成",
+                            "topics": ["梦核"],
+                            "must_have": ["自然运动"],
+                            "forbidden": ["重复画面"],
+                            "max_previews": 2,
+                            "max_finals": 1,
+                            "max_consecutive_failures": 2,
+                        },
+                    )
+                    self.assertEqual(run_response.status_code, 201)
+                    night_run_id = run_response.json()["id"]
+
+                    preview_response = client.post(
+                        "/api/jobs",
+                        json={
+                            "name": "梦核样片",
+                            "prompt": "自然手持穿过明亮的阈限空间",
+                            "mode": "I2VA",
+                            "resolution": "512P 实验",
+                            "duration_seconds": 5,
+                            "simulated": True,
+                            "night_run_id": night_run_id,
+                            "production_stage": "preview",
+                        },
+                    )
+                    self.assertEqual(preview_response.status_code, 201)
+                    preview_id = preview_response.json()["id"]
+
+                    blocked_final = client.post(
+                        "/api/jobs",
+                        json={
+                            "name": "正式版本",
+                            "prompt": "自然手持穿过明亮的阈限空间",
+                            "mode": "I2VA",
+                            "resolution": "768P",
+                            "duration_seconds": 15,
+                            "simulated": True,
+                            "night_run_id": night_run_id,
+                            "production_stage": "final",
+                            "parent_job_id": preview_id,
+                        },
+                    )
+                    self.assertEqual(blocked_final.status_code, 409)
+
+                    main.store.update(
+                        preview_id,
+                        status="completed",
+                        progress=100,
+                        stage="样片完成 · 等待审核",
+                    )
+                    review = client.post(
+                        f"/api/jobs/{preview_id}/review",
+                        json={"decision": "pass", "reasons": ["方向正确"]},
+                    )
+                    self.assertEqual(review.status_code, 200, review.text)
+                    self.assertEqual(review.json()["review_status"], "passed")
+                    duplicate_review = client.post(
+                        f"/api/jobs/{preview_id}/review",
+                        json={"decision": "reject", "reasons": ["重复点击"]},
+                    )
+                    self.assertEqual(duplicate_review.status_code, 409)
+
+                    final_response = client.post(
+                        "/api/jobs",
+                        json={
+                            "name": "正式版本",
+                            "prompt": "自然手持穿过明亮的阈限空间",
+                            "mode": "I2VA",
+                            "resolution": "768P",
+                            "duration_seconds": 15,
+                            "simulated": True,
+                            "night_run_id": night_run_id,
+                            "production_stage": "final",
+                            "parent_job_id": preview_id,
+                        },
+                    )
+                    self.assertEqual(final_response.status_code, 201, final_response.text)
+                    self.assertEqual(final_response.json()["production_stage"], "final")
+            finally:
+                main.store = original_store
+
 
 if __name__ == "__main__":
     unittest.main()

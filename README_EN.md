@@ -16,6 +16,8 @@ FrameFoundry AI brings task creation, local node probing, a single-GPU queue, Co
 
 Version `v1.0.0` is an independent project. It is not a MoneyPrinterTurbo fork and does not include model weights.
 
+The `1.1` development branch includes a **Night Supervisor** MVP: overnight plans generate review-gated previews first, and only an approved preview can unlock a final task. Preview/final budgets, cutoffs, and consecutive-failure circuit breakers are enforced by the local API.
+
 ## What 1.0 includes
 
 - A Chinese-first Web console for T2VA, I2VA, FL2VA, and Ref2VA tasks.
@@ -25,6 +27,8 @@ Version `v1.0.0` is an independent project. It is not a MoneyPrinterTurbo fork a
 - A clearly labeled simulation mode for validating the complete task lifecycle without using a GPU.
 - Real ComfyUI `/prompt` submission, `/history/{prompt_id}` polling, and output registration.
 - Windows scripts for starting the Web console and local FastAPI service together.
+- A local asset center for reusable character, scene, style, prop, audio, and custom references.
+- A review-gated Night Supervisor flow for safer unattended batches.
 
 ## Quick start (Windows)
 
@@ -61,6 +65,7 @@ npm test
 - Health checks prove that an HTTP service responded, not that every model or custom node is installed.
 - Real mode tracks one ComfyUI workflow. Cross-service orchestration across `8189`–`8191` is planned for a later release.
 - Cancelling a submitted real task stops FrameFoundry tracking but does not call ComfyUI's global `/interrupt` endpoint.
+- The Night Supervisor MVP provides deterministic budgets, review gates, and circuit breaking. Automated visual/semantic taste scoring is not presented as complete yet.
 
 See the [Chinese README](README.md) for full API, workflow placeholder, storage, and architecture documentation.
 

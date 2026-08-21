@@ -113,6 +113,49 @@ class StoreTests(unittest.TestCase):
             self.assertEqual(created["asset_ids"], ["asset-1"])
             self.assertEqual(store.asset_paths(["asset-1"]), [asset["file_path"]])
 
+    def test_night_run_review_gate_and_circuit_breaker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = JobStore(Path(directory) / "test.db")
+            store.initialize()
+            night_run = store.create_night_run(
+                {
+                    "id": "night-1",
+                    "name": "夜间校准",
+                    "objective": "先样片，后扩产",
+                    "topics": ["池核", "阈限空间"],
+                    "must_have": ["自然手持"],
+                    "forbidden": ["重复画面"],
+                    "max_previews": 3,
+                    "max_finals": 1,
+                    "max_consecutive_failures": 2,
+                }
+            )
+            self.assertEqual(night_run["status"], "active")
+            for index in range(2):
+                job_id = f"preview-{index}"
+                store.create(
+                    {
+                        "id": job_id,
+                        "name": "校准样片",
+                        "prompt": "自然手持穿过池房",
+                        "mode": "I2VA",
+                        "resolution": "512P",
+                        "duration_seconds": 5,
+                        "simulated": True,
+                        "night_run_id": "night-1",
+                        "production_stage": "preview",
+                    }
+                )
+                store.update(job_id, status="completed", progress=100, stage="样片完成")
+                reviewed = store.review_preview(job_id, "reject", ["动作错误"])
+                self.assertEqual(reviewed["review_status"], "rejected")
+
+            paused = store.get_night_run("night-1")
+            self.assertEqual(paused["status"], "paused")
+            self.assertEqual(paused["consecutive_failures"], 2)
+            self.assertEqual(paused["rejected_count"], 2)
+            self.assertIsNone(store.next_queued())
+
 
 if __name__ == "__main__":
     unittest.main()

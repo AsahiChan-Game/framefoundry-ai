@@ -38,7 +38,11 @@ from .models import (
     AssetPackImport,
     AssetResponse,
     JobCreate,
+    JobReviewRequest,
     JobResponse,
+    NightRunCreate,
+    NightRunResponse,
+    NightRunStatusRequest,
     WorkflowValidateRequest,
     WorkflowValidateResponse,
 )
@@ -75,6 +79,10 @@ def public_job(record: dict[str, Any]) -> JobResponse:
 
 def public_asset(record: dict[str, Any]) -> AssetResponse:
     return AssetResponse.model_validate(record)
+
+
+def public_night_run(record: dict[str, Any]) -> NightRunResponse:
+    return NightRunResponse.model_validate(record)
 
 
 def _safe_filename(filename: str) -> str:
@@ -231,7 +239,11 @@ async def run_simulated_job(job: dict[str, Any]) -> None:
     store.update(
         job["id"],
         status="completed",
-        stage="模拟流程完成",
+        stage=(
+            "样片完成 · 等待审核"
+            if job.get("production_stage") == "preview"
+            else "模拟流程完成"
+        ),
         progress=100,
         output_path=str(manifest_path),
     )
@@ -296,7 +308,11 @@ async def run_real_job(job: dict[str, Any]) -> None:
         job["id"],
         status="completed",
         progress=100,
-        stage="ComfyUI 生成完成",
+        stage=(
+            "样片完成 · 等待审核"
+            if job.get("production_stage") == "preview"
+            else "ComfyUI 生成完成"
+        ),
         output_path=output_path,
     )
 
@@ -304,6 +320,7 @@ async def run_real_job(job: dict[str, Any]) -> None:
 async def queue_dispatcher() -> None:
     logger.info("Single-GPU queue dispatcher started")
     while True:
+        store.pause_expired_night_runs()
         job = store.next_queued()
         if job is None:
             await asyncio.sleep(0.5)
@@ -433,6 +450,47 @@ async def import_asset_pack(payload: AssetPackImport) -> dict[str, Any]:
     }
 
 
+@app.get("/api/night-runs")
+async def list_night_runs(
+    limit: int = Query(default=100, ge=1, le=200),
+) -> dict[str, Any]:
+    return {
+        "night_runs": [
+            public_night_run(record) for record in store.list_night_runs(limit)
+        ]
+    }
+
+
+@app.get("/api/night-runs/{night_run_id}", response_model=NightRunResponse)
+async def get_night_run(night_run_id: str) -> NightRunResponse:
+    try:
+        return public_night_run(store.get_night_run(night_run_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="守夜计划不存在") from exc
+
+
+@app.post("/api/night-runs", response_model=NightRunResponse, status_code=201)
+async def create_night_run(payload: NightRunCreate) -> NightRunResponse:
+    record = store.create_night_run(
+        {**payload.model_dump(), "id": uuid.uuid4().hex[:16]}
+    )
+    return public_night_run(record)
+
+
+@app.post(
+    "/api/night-runs/{night_run_id}/status", response_model=NightRunResponse
+)
+async def update_night_run_status(
+    night_run_id: str, payload: NightRunStatusRequest
+) -> NightRunResponse:
+    try:
+        return public_night_run(
+            store.update_night_run_status(night_run_id, payload.status)
+        )
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="守夜计划不存在") from exc
+
+
 @app.get("/api/jobs")
 async def list_jobs(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
     return {"jobs": [public_job(record) for record in store.list(limit=limit)]}
@@ -450,6 +508,38 @@ async def get_job(job_id: str) -> JobResponse:
 async def create_job(payload: JobCreate) -> JobResponse:
     if payload.target_node not in {node.id for node in NODES}:
         raise HTTPException(status_code=422, detail="目标节点不在允许列表中")
+    if payload.production_stage != "manual":
+        store.pause_expired_night_runs()
+        try:
+            night_run = store.get_night_run(payload.night_run_id or "")
+        except KeyError as exc:
+            raise HTTPException(status_code=422, detail="守夜计划不存在") from exc
+        if night_run["status"] != "active":
+            raise HTTPException(status_code=409, detail="守夜计划当前未处于运行状态")
+        if (
+            payload.production_stage == "preview"
+            and night_run["preview_count"] >= night_run["max_previews"]
+        ):
+            raise HTTPException(status_code=409, detail="守夜计划已达到样片预算上限")
+        if (
+            payload.production_stage == "final"
+            and night_run["final_count"] >= night_run["max_finals"]
+        ):
+            raise HTTPException(status_code=409, detail="守夜计划已达到正式成片预算上限")
+        if payload.production_stage == "final":
+            try:
+                parent = store.get(payload.parent_job_id or "")
+            except KeyError as exc:
+                raise HTTPException(status_code=422, detail="关联样片不存在") from exc
+            if (
+                parent.get("night_run_id") != payload.night_run_id
+                or parent.get("production_stage") != "preview"
+                or parent.get("review_status") != "passed"
+            ):
+                raise HTTPException(
+                    status_code=409,
+                    detail="只有同一守夜计划中已通过审核的样片才能进入正式生产",
+                )
     job_id = uuid.uuid4().hex[:16]
     reference_path = save_reference(job_id, payload)
     try:
@@ -471,6 +561,16 @@ async def create_job(payload: JobCreate) -> JobResponse:
         }
     )
     return public_job(record)
+
+
+@app.post("/api/jobs/{job_id}/review", response_model=JobResponse)
+async def review_job(job_id: str, payload: JobReviewRequest) -> JobResponse:
+    try:
+        return public_job(store.review_preview(job_id, payload.decision, payload.reasons))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="任务不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/jobs/{job_id}/cancel", response_model=JobResponse)

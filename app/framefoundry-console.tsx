@@ -26,7 +26,9 @@ import {
   List,
   Menu,
   MonitorDot,
+  MoonStar,
   MoreHorizontal,
+  Pause,
   Play,
   Palette,
   Plus,
@@ -35,10 +37,13 @@ import {
   Search,
   Server,
   Settings,
+  ShieldCheck,
   SlidersHorizontal,
   Sparkles,
   Square,
   TerminalSquare,
+  ThumbsDown,
+  ThumbsUp,
   Upload,
   UserRound,
   WandSparkles,
@@ -47,9 +52,12 @@ import {
 import type { LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-type Section = "create" | "queue" | "workflows" | "assets" | "nodes";
+type Section = "create" | "night" | "queue" | "workflows" | "assets" | "nodes";
 type NodeState = "online" | "offline" | "checking";
 type JobState = "queued" | "running" | "completed" | "failed" | "cancelled";
+type ProductionStage = "manual" | "preview" | "final";
+type ReviewStatus = "not_required" | "needs_review" | "passed" | "rejected";
+type NightRunStatus = "active" | "paused" | "completed" | "cancelled";
 type AssetKind = "character" | "scene" | "style" | "prop" | "audio" | "custom";
 type AssetControl = "identity" | "scene" | "style" | "prop" | "audio" | "reference";
 
@@ -73,9 +81,56 @@ type Job = {
   created_at: string;
   mode: string;
   resolution: string;
+  duration_seconds: number;
+  seed?: number | null;
   simulated: boolean;
   output_path?: string | null;
   asset_ids: string[];
+  night_run_id?: string | null;
+  production_stage: ProductionStage;
+  parent_job_id?: string | null;
+  review_status: ReviewStatus;
+  review_reasons: string[];
+};
+
+type NightRun = {
+  id: string;
+  name: string;
+  objective: string;
+  status: NightRunStatus;
+  topics: string[];
+  must_have: string[];
+  should_have: string[];
+  explore: string[];
+  forbidden: string[];
+  max_previews: number;
+  max_finals: number;
+  max_consecutive_failures: number;
+  consecutive_failures: number;
+  cutoff_at?: string | null;
+  fallback_policy: string;
+  preview_count: number;
+  final_count: number;
+  awaiting_review_count: number;
+  passed_count: number;
+  rejected_count: number;
+  created_at: string;
+  updated_at: string;
+};
+
+type NightRunDraft = {
+  name: string;
+  objective: string;
+  topics: string[];
+  must_have: string[];
+  should_have: string[];
+  explore: string[];
+  forbidden: string[];
+  max_previews: number;
+  max_finals: number;
+  max_consecutive_failures: number;
+  cutoff_at: string | null;
+  fallback_policy: string;
 };
 
 type Asset = {
@@ -105,6 +160,7 @@ const NAV_ITEMS: Array<{
   icon: LucideIcon;
 }> = [
   { id: "create", label: "创作台", sublabel: "Create", icon: LayoutDashboard },
+  { id: "night", label: "守夜监制", sublabel: "Night Supervisor", icon: MoonStar },
   { id: "queue", label: "任务队列", sublabel: "Queue", icon: Layers3 },
   { id: "workflows", label: "工作流", sublabel: "Workflows", icon: Boxes },
   { id: "assets", label: "素材库", sublabel: "Assets", icon: FolderOpen },
@@ -206,6 +262,7 @@ export function FrameFoundryConsole() {
   const [nodes, setNodes] = useState<PipelineNode[]>(DEFAULT_NODES);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [assets, setAssets] = useState<Asset[]>([]);
+  const [nightRuns, setNightRuns] = useState<NightRun[]>([]);
   const [selectedAssetIds, setSelectedAssetIds] = useState<string[]>([]);
   const [prompt, setPrompt] = useState(
     "一只橘猫在无尽的荧光灯走廊中谨慎前行，低机位跟拍，空气中有轻微尘埃，环境压抑但不恐怖，连续单镜头。",
@@ -222,6 +279,9 @@ export function FrameFoundryConsole() {
   const [notice, setNotice] = useState<string | null>(null);
   const [queueFilter, setQueueFilter] = useState<"all" | JobState>("all");
   const [searchTerm, setSearchTerm] = useState("");
+  const [selectedNightRunId, setSelectedNightRunId] = useState("");
+  const [productionStage, setProductionStage] = useState<ProductionStage>("manual");
+  const [parentJobId, setParentJobId] = useState("");
 
   const refreshAssets = useCallback(async () => {
     const response = await fetch(`${API_BASE}/assets`, { cache: "no-store" });
@@ -231,24 +291,34 @@ export function FrameFoundryConsole() {
     setSelectedAssetIds((current) => current.filter((id) => payload.assets.some((asset) => asset.id === id)));
   }, []);
 
+  const refreshNightRuns = useCallback(async () => {
+    const response = await fetch(`${API_BASE}/night-runs`, { cache: "no-store" });
+    if (!response.ok) throw new Error("night run request was not successful");
+    const payload = (await response.json()) as { night_runs: NightRun[] };
+    setNightRuns(payload.night_runs);
+  }, []);
+
   const fetchRuntime = useCallback(async () => {
     setApiState("connecting");
     try {
-      const [healthResponse, nodeResponse, jobsResponse, assetsResponse] = await Promise.all([
+      const [healthResponse, nodeResponse, jobsResponse, assetsResponse, nightRunsResponse] = await Promise.all([
         fetch(`${API_BASE}/health`, { cache: "no-store" }),
         fetch(`${API_BASE}/nodes`, { cache: "no-store" }),
         fetch(`${API_BASE}/jobs`, { cache: "no-store" }),
         fetch(`${API_BASE}/assets`, { cache: "no-store" }),
+        fetch(`${API_BASE}/night-runs`, { cache: "no-store" }),
       ]);
-      if (!healthResponse.ok || !nodeResponse.ok || !jobsResponse.ok || !assetsResponse.ok) {
+      if (!healthResponse.ok || !nodeResponse.ok || !jobsResponse.ok || !assetsResponse.ok || !nightRunsResponse.ok) {
         throw new Error("API response was not successful");
       }
       const nodePayload = (await nodeResponse.json()) as { nodes: PipelineNode[] };
       const jobsPayload = (await jobsResponse.json()) as { jobs: Job[] };
       const assetsPayload = (await assetsResponse.json()) as { assets: Asset[] };
+      const nightRunsPayload = (await nightRunsResponse.json()) as { night_runs: NightRun[] };
       setNodes(nodePayload.nodes);
       setJobs(jobsPayload.jobs);
       setAssets(assetsPayload.assets);
+      setNightRuns(nightRunsPayload.night_runs);
       setSelectedAssetIds((current) => current.filter((id) => assetsPayload.assets.some((asset) => asset.id === id)));
       setApiState("online");
     } catch {
@@ -314,6 +384,10 @@ export function FrameFoundryConsole() {
       setNotice("本地控制 API 未启动，请先运行 scripts/start-local.ps1。");
       return;
     }
+    if (productionStage === "final" && !parentJobId) {
+      setNotice("正式生产必须选择一条已通过审核的样片。");
+      return;
+    }
     setSubmitting(true);
     try {
       if (reference && reference.size > 20 * 1024 * 1024) {
@@ -377,15 +451,21 @@ export function FrameFoundryConsole() {
           reference_mime: reference?.type ?? null,
           reference_data: referenceData,
           asset_ids: selectedAssetIds,
+          night_run_id: selectedNightRunId || null,
+          production_stage: selectedNightRunId ? productionStage : "manual",
+          parent_job_id: productionStage === "final" ? parentJobId : null,
         }),
       });
-      if (!response.ok) throw new Error("create job failed");
+      if (!response.ok) {
+        const failure = await response.json().catch(() => null) as { detail?: string } | null;
+        throw new Error(failure?.detail ?? "任务创建失败");
+      }
       const created = (await response.json()) as Job;
       setJobs((current) => [created, ...current]);
       setNotice(simulation ? "模拟任务已进入队列。" : "真实任务已进入队列。");
       setSection("queue");
     } catch (error) {
-      setNotice(error instanceof SyntaxError ? "工作流 JSON 格式无效。" : "任务创建失败，请检查本地 API 日志。");
+      setNotice(error instanceof SyntaxError ? "工作流 JSON 格式无效。" : error instanceof Error ? error.message : "任务创建失败，请检查本地 API 日志。");
     } finally {
       setSubmitting(false);
     }
@@ -401,6 +481,74 @@ export function FrameFoundryConsole() {
     } catch {
       setNotice("取消失败，请检查 API 状态。");
     }
+  }
+
+  async function createNightRun(payload: NightRunDraft) {
+    const response = await fetch(`${API_BASE}/night-runs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    if (!response.ok) throw new Error("守夜计划创建失败");
+    const created = (await response.json()) as NightRun;
+    setNightRuns((current) => [created, ...current]);
+    setNotice("守夜计划已启动；先提交低成本样片进行校准。");
+  }
+
+  async function updateNightRunStatus(id: string, status: NightRunStatus) {
+    try {
+      const response = await fetch(`${API_BASE}/night-runs/${id}/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      if (!response.ok) throw new Error("status update failed");
+      const updated = (await response.json()) as NightRun;
+      setNightRuns((current) => current.map((run) => run.id === id ? updated : run));
+      setNotice(status === "active" ? "守夜计划已恢复。" : status === "paused" ? "守夜计划已暂停，队列不会继续取新任务。" : "守夜计划状态已更新。");
+    } catch {
+      setNotice("守夜计划状态更新失败。");
+    }
+  }
+
+  async function reviewNightJob(jobId: string, decision: "pass" | "reject", reasons: string[]) {
+    try {
+      const response = await fetch(`${API_BASE}/jobs/${jobId}/review`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision, reasons }),
+      });
+      if (!response.ok) throw new Error("review failed");
+      const updated = (await response.json()) as Job;
+      setJobs((current) => current.map((job) => job.id === jobId ? updated : job));
+      try {
+        await refreshNightRuns();
+      } catch {
+        // The regular runtime poll will refresh plan counters.
+      }
+      setNotice(decision === "pass" ? "样片已通过，正式生产入口已解锁。" : "样片已拒绝；达到连续失败阈值时会自动暂停整批任务。");
+    } catch {
+      setNotice("样片审核失败，请刷新后重试。");
+    }
+  }
+
+  function prepareNightJob(runId: string, stage: "preview" | "final", source?: Job) {
+    setSelectedNightRunId(runId);
+    setProductionStage(stage);
+    setParentJobId(source?.id ?? "");
+    if (stage === "preview") {
+      setResolution("512P 实验");
+      setDuration("5");
+    } else if (source) {
+      setProjectName(`${source.name} · 正式版`);
+      setPrompt(source.prompt);
+      setMode(source.mode);
+      setResolution("768P");
+      setDuration(String(Math.max(source.duration_seconds, 8)));
+      setSeed(source.seed == null ? "随机" : String(source.seed));
+      setSelectedAssetIds(source.asset_ids);
+    }
+    setSection("create");
   }
 
   function toggleAsset(assetId: string) {
@@ -457,6 +605,7 @@ export function FrameFoundryConsole() {
                   <small>{item.sublabel}</small>
                 </span>
                 {item.id === "queue" && jobs.length > 0 ? <b>{jobs.length}</b> : null}
+                {item.id === "night" && nightRuns.reduce((total, run) => total + run.awaiting_review_count, 0) > 0 ? <b>{nightRuns.reduce((total, run) => total + run.awaiting_review_count, 0)}</b> : null}
               </button>
             );
           })}
@@ -525,6 +674,24 @@ export function FrameFoundryConsole() {
               assets={assets}
               selectedAssetIds={selectedAssetIds}
               toggleAsset={toggleAsset}
+              nightRuns={nightRuns}
+              selectedNightRunId={selectedNightRunId}
+              setSelectedNightRunId={setSelectedNightRunId}
+              productionStage={productionStage}
+              setProductionStage={setProductionStage}
+              parentJobId={parentJobId}
+              setParentJobId={setParentJobId}
+            />
+          ) : null}
+          {section === "night" ? (
+            <NightSupervisorView
+              nightRuns={nightRuns}
+              jobs={jobs}
+              createNightRun={createNightRun}
+              updateNightRunStatus={updateNightRunStatus}
+              reviewNightJob={reviewNightJob}
+              prepareNightJob={prepareNightJob}
+              announce={setNotice}
             />
           ) : null}
           {section === "queue" ? (
@@ -582,11 +749,24 @@ type CreateViewProps = {
   assets: Asset[];
   selectedAssetIds: string[];
   toggleAsset: (assetId: string) => void;
+  nightRuns: NightRun[];
+  selectedNightRunId: string;
+  setSelectedNightRunId: (value: string) => void;
+  productionStage: ProductionStage;
+  setProductionStage: (value: ProductionStage) => void;
+  parentJobId: string;
+  setParentJobId: (value: string) => void;
 };
 
 function CreateView(props: CreateViewProps) {
   const onlinePercent = Math.round((props.onlineNodes / Math.max(props.nodes.length, 1)) * 100);
   const selectedAssets = props.assets.filter((asset) => props.selectedAssetIds.includes(asset.id));
+  const activeNightRuns = props.nightRuns.filter((run) => run.status === "active");
+  const passedPreviews = props.jobs.filter(
+    (job) => job.night_run_id === props.selectedNightRunId
+      && job.production_stage === "preview"
+      && job.review_status === "passed",
+  );
   return (
     <>
       <section className="page-heading">
@@ -687,6 +867,37 @@ function CreateView(props: CreateViewProps) {
                 <button type="button" className="secondary-button asset-browse-button" onClick={() => props.openSection("assets")}><FolderOpen size={15} />浏览资产</button>
               </div>
             </div>
+            <div className="field full-field night-link-field">
+              <span>守夜计划 <em>Night Supervisor</em></span>
+              <div className="night-link-grid">
+                <select
+                  aria-label="关联守夜计划"
+                  value={props.selectedNightRunId}
+                  onChange={(event) => {
+                    const value = event.target.value;
+                    props.setSelectedNightRunId(value);
+                    props.setProductionStage(value ? "preview" : "manual");
+                    props.setParentJobId("");
+                  }}
+                >
+                  <option value="">普通任务 · 不进入夜班审核门</option>
+                  {activeNightRuns.map((run) => <option key={run.id} value={run.id}>{run.name}</option>)}
+                </select>
+                {props.selectedNightRunId ? (
+                  <div className="segmented-control compact-segmented">
+                    <button type="button" className={props.productionStage === "preview" ? "selected" : ""} onClick={() => { props.setProductionStage("preview"); props.setParentJobId(""); }}>低成本样片</button>
+                    <button type="button" className={props.productionStage === "final" ? "selected" : ""} onClick={() => props.setProductionStage("final")}>正式生产</button>
+                  </div>
+                ) : null}
+              </div>
+              {props.selectedNightRunId && props.productionStage === "final" ? (
+                <select aria-label="已通过的父样片" value={props.parentJobId} onChange={(event) => props.setParentJobId(event.target.value)}>
+                  <option value="">选择已通过审核的样片…</option>
+                  {passedPreviews.map((job) => <option key={job.id} value={job.id}>{job.name} · {job.id.slice(0, 6)}</option>)}
+                </select>
+              ) : null}
+              <small>{props.selectedNightRunId ? props.productionStage === "preview" ? "样片完成后会停在晨间审片台，不会自动高清。" : "只有已通过样片能进入正式生产。" : "普通任务沿用 1.0 的直接队列。"}</small>
+            </div>
             <label className="field"><span>输出尺寸 <em>Resolution</em></span><select value={props.resolution} onChange={(event) => props.setResolution(event.target.value)}><option>768P</option><option>1080P</option><option>512P 实验</option></select></label>
             <label className="field"><span>时长 <em>Duration</em></span><div className="input-suffix"><input type="number" min="3" max="30" value={props.duration} onChange={(event) => props.setDuration(event.target.value)} /><b>秒</b></div></label>
             <label className="field"><span>随机种子 <em>Seed</em></span><input value={props.seed} onChange={(event) => props.setSeed(event.target.value)} /></label>
@@ -749,7 +960,162 @@ function RecentJobs({ jobs, openQueue }: { jobs: Job[]; openQueue: () => void })
 }
 
 function JobRow({ job, onCancel }: { job: Job; onCancel?: (id: string) => void }) {
-  return <div className="job-row"><div className="job-thumb"><Film size={18} /><span>{job.mode}</span></div><div className="job-main"><div><strong>{job.name}</strong>{job.simulated ? <b className="demo-tag">模拟</b> : null}</div><span>{job.resolution} · {formatTime(job.created_at)} · {job.stage}</span></div><div className="job-progress"><div><span style={{ width: `${job.progress}%` }} /></div><b>{job.progress}%</b></div><span className={`status-chip ${job.status}`}><i />{jobStatusLabel(job.status)}</span>{onCancel && (job.status === "queued" || job.status === "running") ? <button className="icon-button small" onClick={() => onCancel(job.id)} aria-label={`取消 ${job.name}`}><Square size={13} /></button> : <span />}</div>;
+  return <div className="job-row"><div className="job-thumb"><Film size={18} /><span>{job.mode}</span></div><div className="job-main"><div><strong>{job.name}</strong>{job.simulated ? <b className="demo-tag">模拟</b> : null}{job.production_stage === "preview" ? <b className="preview-tag">样片</b> : job.production_stage === "final" ? <b className="final-tag">正式</b> : null}</div><span>{job.resolution} · {formatTime(job.created_at)} · {job.stage}</span></div><div className="job-progress"><div><span style={{ width: `${job.progress}%` }} /></div><b>{job.progress}%</b></div><span className={`status-chip ${job.status}`}><i />{jobStatusLabel(job.status)}</span>{onCancel && (job.status === "queued" || job.status === "running") ? <button className="icon-button small" onClick={() => onCancel(job.id)} aria-label={`取消 ${job.name}`}><Square size={13} /></button> : <span />}</div>;
+}
+
+type NightSupervisorViewProps = {
+  nightRuns: NightRun[];
+  jobs: Job[];
+  createNightRun: (payload: NightRunDraft) => Promise<void>;
+  updateNightRunStatus: (id: string, status: NightRunStatus) => Promise<void>;
+  reviewNightJob: (jobId: string, decision: "pass" | "reject", reasons: string[]) => Promise<void>;
+  prepareNightJob: (runId: string, stage: "preview" | "final", source?: Job) => void;
+  announce: (message: string) => void;
+};
+
+function NightSupervisorView(props: NightSupervisorViewProps) {
+  const [showComposer, setShowComposer] = useState(props.nightRuns.length === 0);
+  const [saving, setSaving] = useState(false);
+  const [name, setName] = useState("今晚 · 样片校准");
+  const [objective, setObjective] = useState("先验证创意方向和核心动作，再决定是否扩大生产与高清化。");
+  const [topics, setTopics] = useState("梦核，池核，阈限空间");
+  const [mustHave, setMustHave] = useState("奇诡但自然，画面有美感，核心动作明确");
+  const [shouldHave, setShouldHave] = useState("自然手持，柔焦黑柔，开头有短视频钩子");
+  const [explore, setExplore] = useState("允许少量反差和恶搞趣味");
+  const [forbidden, setForbidden] = useState("重复参考图，静止假动作，过暗，乱码文字");
+  const [fallbackPolicy, setFallbackPolicy] = useState("新方向连续失败后暂停，剩余预算回到最近审核通过的稳定题材。");
+  const [maxPreviews, setMaxPreviews] = useState("8");
+  const [maxFinals, setMaxFinals] = useState("4");
+  const [failureLimit, setFailureLimit] = useState("2");
+  const [cutoffAt, setCutoffAt] = useState("");
+
+  const awaitingJobs = props.jobs.filter(
+    (job) => job.production_stage === "preview"
+      && job.status === "completed"
+      && job.review_status === "needs_review",
+  );
+  const passedJobs = props.jobs.filter(
+    (job) => job.production_stage === "preview" && job.review_status === "passed",
+  );
+  const activeRuns = props.nightRuns.filter((run) => run.status === "active").length;
+  const pausedRuns = props.nightRuns.filter((run) => run.status === "paused").length;
+
+  function rules(value: string) {
+    return value.split(/[，,\n]/).map((item) => item.trim()).filter(Boolean);
+  }
+
+  async function submitNightRun() {
+    if (!name.trim() || !objective.trim()) {
+      props.announce("请填写守夜计划名称和今晚的目标。");
+      return;
+    }
+    setSaving(true);
+    try {
+      await props.createNightRun({
+        name: name.trim(),
+        objective: objective.trim(),
+        topics: rules(topics),
+        must_have: rules(mustHave),
+        should_have: rules(shouldHave),
+        explore: rules(explore),
+        forbidden: rules(forbidden),
+        max_previews: Number(maxPreviews),
+        max_finals: Number(maxFinals),
+        max_consecutive_failures: Number(failureLimit),
+        cutoff_at: cutoffAt ? new Date(cutoffAt).toISOString() : null,
+        fallback_policy: fallbackPolicy.trim(),
+      });
+      setShowComposer(false);
+    } catch {
+      props.announce("守夜计划创建失败，请检查预算和截止时间。");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <>
+      <SectionHeading
+        eyebrow="NIGHT SUPERVISOR"
+        title="守夜监制"
+        description="把过夜生产拆成样片校准、人工审核和正式扩产；方向错误时自动熔断。"
+        action={<button className="primary-button" onClick={() => setShowComposer((current) => !current)}><Plus size={17} />新建守夜计划</button>}
+      />
+
+      <section className="metrics-grid night-metrics" aria-label="守夜概览">
+        <MetricCard label="运行计划" value={String(activeRuns).padStart(2, "0")} suffix="个" icon={MoonStar} tone="purple" detail="只调度运行中的批次" />
+        <MetricCard label="等待审片" value={String(awaitingJobs.length).padStart(2, "0")} suffix="条样片" icon={Clock3} tone="amber" detail="不会自动进入高清" />
+        <MetricCard label="已通过" value={String(passedJobs.length).padStart(2, "0")} suffix="条样片" icon={ShieldCheck} tone="green" detail="已解锁正式生产" />
+        <MetricCard label="已熔断" value={String(pausedRuns).padStart(2, "0")} suffix="个计划" icon={Pause} tone="blue" detail="暂停后不再取新任务" />
+      </section>
+
+      {showComposer ? (
+        <section className="panel night-composer" id="night-composer">
+          <div className="panel-header">
+            <div><span className="panel-kicker">OVERNIGHT CONTRACT</span><h2><MoonStar size={19} />今晚的生产契约</h2></div>
+            <button className="icon-button small" onClick={() => setShowComposer(false)} aria-label="关闭守夜计划表单"><X size={15} /></button>
+          </div>
+          <div className="form-grid night-form-grid">
+            <label className="field"><span>计划名称 <em>Name</em></span><input value={name} onChange={(event) => setName(event.target.value)} /></label>
+            <label className="field"><span>停止时间 <em>Cutoff</em></span><input type="datetime-local" value={cutoffAt} onChange={(event) => setCutoffAt(event.target.value)} /></label>
+            <label className="field full-field"><span>今晚目标 <em>Objective</em></span><textarea value={objective} onChange={(event) => setObjective(event.target.value)} /></label>
+            <label className="field full-field"><span>题材分组 <em>Topics</em></span><input value={topics} onChange={(event) => setTopics(event.target.value)} placeholder="用逗号分隔" /></label>
+            <label className="field"><span>必须满足 <em>Must</em></span><textarea value={mustHave} onChange={(event) => setMustHave(event.target.value)} /></label>
+            <label className="field"><span>禁止出现 <em>Never</em></span><textarea value={forbidden} onChange={(event) => setForbidden(event.target.value)} /></label>
+            <label className="field"><span>尽量满足 <em>Should</em></span><textarea value={shouldHave} onChange={(event) => setShouldHave(event.target.value)} /></label>
+            <label className="field"><span>允许探索 <em>Explore</em></span><textarea value={explore} onChange={(event) => setExplore(event.target.value)} /></label>
+            <label className="field"><span>样片上限 <em>Preview budget</em></span><input type="number" min="1" max="200" value={maxPreviews} onChange={(event) => setMaxPreviews(event.target.value)} /></label>
+            <label className="field"><span>正式片上限 <em>Final budget</em></span><input type="number" min="1" max="100" value={maxFinals} onChange={(event) => setMaxFinals(event.target.value)} /></label>
+            <label className="field"><span>连续失败熔断 <em>Circuit breaker</em></span><input type="number" min="1" max="20" value={failureLimit} onChange={(event) => setFailureLimit(event.target.value)} /></label>
+            <label className="field full-field"><span>失败后的保底策略 <em>Fallback</em></span><input value={fallbackPolicy} onChange={(event) => setFallbackPolicy(event.target.value)} /></label>
+          </div>
+          <div className="asset-composer-actions"><button className="secondary-button" onClick={() => setShowComposer(false)}>取消</button><button className="primary-button" disabled={saving} onClick={() => { void submitNightRun(); }}>{saving ? <LoaderCircle className="spin" size={16} /> : <ShieldCheck size={16} />}{saving ? "正在创建…" : "启动守夜计划"}</button></div>
+        </section>
+      ) : null}
+
+      <div className="night-run-grid">
+        {props.nightRuns.map((run) => {
+          const progress = Math.min(100, Math.round((run.preview_count / Math.max(run.max_previews, 1)) * 100));
+          return (
+            <article className={classNames("panel", "night-run-card", `run-${run.status}`)} key={run.id}>
+              <div className="night-run-head"><div><span className="panel-kicker">{run.id.slice(0, 8)}</span><h3>{run.name}</h3></div><span className={classNames("run-status", run.status)}><i />{run.status === "active" ? "运行中" : run.status === "paused" ? "已暂停" : run.status === "completed" ? "已完成" : "已取消"}</span></div>
+              <p>{run.objective}</p>
+              <div className="night-budget"><div><span style={{ width: `${progress}%` }} /></div><b>样片 {run.preview_count}/{run.max_previews} · 正式 {run.final_count}/{run.max_finals}</b></div>
+              <div className="night-stat-row"><span>待审 <b>{run.awaiting_review_count}</b></span><span>通过 <b>{run.passed_count}</b></span><span>拒绝 <b>{run.rejected_count}</b></span><span>连续失败 <b>{run.consecutive_failures}/{run.max_consecutive_failures}</b></span></div>
+              <div className="night-rule-groups">
+                <div><strong>必须</strong>{run.must_have.slice(0, 3).map((rule) => <span key={rule}>{rule}</span>)}</div>
+                <div className="forbidden"><strong>禁止</strong>{run.forbidden.slice(0, 3).map((rule) => <span key={rule}>{rule}</span>)}</div>
+              </div>
+              <div className="night-run-actions">
+                {run.status === "active" ? <><button className="primary-button" onClick={() => props.prepareNightJob(run.id, "preview")}><Play size={15} />添加校准样片</button><button className="secondary-button" onClick={() => { void props.updateNightRunStatus(run.id, "paused"); }}><Pause size={15} />暂停</button></> : null}
+                {run.status === "paused" ? <button className="primary-button" onClick={() => { void props.updateNightRunStatus(run.id, "active"); }}><Play size={15} />恢复计划</button> : null}
+                {(run.status === "active" || run.status === "paused") ? <button className="text-button" onClick={() => { void props.updateNightRunStatus(run.id, "completed"); }}>结束本轮</button> : null}
+              </div>
+            </article>
+          );
+        })}
+      </div>
+
+      <section className="panel review-desk">
+        <div className="panel-header compact"><div><span className="panel-kicker">MORNING REVIEW</span><h2><ShieldCheck size={18} />晨间审片台</h2></div><span className="review-count">{awaitingJobs.length} 条等待决定</span></div>
+        {awaitingJobs.length ? (
+          <div className="review-list">
+            {awaitingJobs.map((job) => (
+              <article className="review-card" key={job.id}>
+                <div className="review-thumb"><Film size={22} /><span>{job.mode}</span></div>
+                <div className="review-copy"><div><strong>{job.name}</strong><b>{job.resolution} · {job.duration_seconds}s</b></div><p>{job.prompt}</p><small>{job.output_path ?? "产物正在登记"}</small></div>
+                <div className="review-actions"><button className="review-pass" onClick={() => { void props.reviewNightJob(job.id, "pass", ["方向正确"]); }}><ThumbsUp size={15} />通过</button><button onClick={() => { void props.reviewNightJob(job.id, "reject", ["没意思"]); }}><ThumbsDown size={14} />没意思</button><button onClick={() => { void props.reviewNightJob(job.id, "reject", ["动作错误"]); }}>动作错误</button><button onClick={() => { void props.reviewNightJob(job.id, "reject", ["内容重复"]); }}>重复</button><button onClick={() => { void props.reviewNightJob(job.id, "reject", ["画面太暗"]); }}>太暗</button></div>
+              </article>
+            ))}
+          </div>
+        ) : <EmptyState icon={ShieldCheck} title="暂时没有等待审核的样片" description="样片完成后会停在这里，不会直接进入高清和后处理。" action="查看运行计划" onAction={() => document.querySelector(".night-run-grid")?.scrollIntoView({ behavior: "smooth" })} />}
+      </section>
+
+      {passedJobs.length ? (
+        <section className="panel approved-previews"><div className="panel-header compact"><div><span className="panel-kicker">PROMOTION GATE</span><h2><ThumbsUp size={18} />已通过样片</h2></div><span className="review-count">{passedJobs.length} 条可扩产</span></div><div className="approved-grid">{passedJobs.map((job) => <article key={job.id}><div><strong>{job.name}</strong><span>{job.review_reasons.join(" · ") || "人工审核通过"}</span></div><button className="primary-button" onClick={() => props.prepareNightJob(job.night_run_id ?? "", "final", job)}>进入正式生产</button></article>)}</div></section>
+      ) : null}
+    </>
+  );
 }
 
 function QueueView({ jobs, filter, setFilter, cancelJob, openCreate }: { jobs: Job[]; filter: "all" | JobState; setFilter: (value: "all" | JobState) => void; cancelJob: (id: string) => void; openCreate: () => void }) {
