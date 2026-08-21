@@ -144,6 +144,52 @@ class JobStore:
                 "CREATE INDEX IF NOT EXISTS idx_jobs_night_run "
                 "ON jobs(night_run_id, production_stage, review_status)"
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS library_items (
+                    id TEXT PRIMARY KEY,
+                    source_kind TEXT NOT NULL,
+                    source_key TEXT NOT NULL UNIQUE,
+                    job_id TEXT,
+                    name TEXT NOT NULL,
+                    batch_name TEXT NOT NULL DEFAULT '',
+                    file_path TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    media_type TEXT NOT NULL DEFAULT 'video/mp4',
+                    size_bytes INTEGER NOT NULL DEFAULT 0,
+                    modified_at TEXT NOT NULL,
+                    prompt TEXT NOT NULL DEFAULT '',
+                    mode TEXT NOT NULL DEFAULT '',
+                    stage TEXT NOT NULL DEFAULT 'unknown',
+                    seed INTEGER,
+                    width INTEGER,
+                    height INTEGER,
+                    duration_seconds REAL,
+                    fps REAL,
+                    qc_status TEXT NOT NULL DEFAULT 'unreviewed',
+                    review_notes TEXT NOT NULL DEFAULT '',
+                    metadata_quality TEXT NOT NULL DEFAULT 'filename_only',
+                    reference_paths_json TEXT NOT NULL DEFAULT '[]',
+                    asset_ids_json TEXT NOT NULL DEFAULT '[]',
+                    variants_json TEXT NOT NULL DEFAULT '[]',
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_library_file_path "
+                "ON library_items(file_path COLLATE NOCASE)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_library_modified_at "
+                "ON library_items(modified_at DESC)"
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_library_filters "
+                "ON library_items(source_kind, stage, metadata_quality, qc_status)"
+            )
             connection.commit()
 
     def create(self, values: dict[str, Any]) -> dict[str, Any]:
@@ -469,6 +515,216 @@ class JobStore:
             connection.commit()
         return self.get(job_id)
 
+    def upsert_library_item(self, values: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        file_path = str(Path(values["file_path"]).resolve())
+        metadata_rank = {"filename_only": 0, "partial": 1, "complete": 2}
+        with self._lock, self._connection() as connection:
+            existing = connection.execute(
+                """
+                SELECT * FROM library_items
+                WHERE source_key = ? OR file_path = ? COLLATE NOCASE
+                LIMIT 1
+                """,
+                (values["source_key"], file_path),
+            ).fetchone()
+            if existing is not None and metadata_rank.get(
+                values.get("metadata_quality", "filename_only"), 0
+            ) < metadata_rank.get(existing["metadata_quality"], 0):
+                return self._decode_library_item(existing)
+
+            record = {
+                "id": existing["id"] if existing is not None else values["id"],
+                "source_kind": values.get("source_kind", "discovered"),
+                "source_key": values["source_key"],
+                "job_id": values.get("job_id"),
+                "name": values.get("name") or Path(file_path).stem,
+                "batch_name": values.get("batch_name", ""),
+                "file_path": file_path,
+                "file_name": values.get("file_name") or Path(file_path).name,
+                "media_type": values.get("media_type", "video/mp4"),
+                "size_bytes": int(values.get("size_bytes") or 0),
+                "modified_at": values.get("modified_at") or now,
+                "prompt": values.get("prompt", ""),
+                "mode": values.get("mode", ""),
+                "stage": values.get("stage", "unknown"),
+                "seed": values.get("seed"),
+                "width": values.get("width"),
+                "height": values.get("height"),
+                "duration_seconds": values.get("duration_seconds"),
+                "fps": values.get("fps"),
+                "qc_status": values.get("qc_status", "unreviewed"),
+                "review_notes": values.get("review_notes", ""),
+                "metadata_quality": values.get(
+                    "metadata_quality", "filename_only"
+                ),
+                "reference_paths_json": json.dumps(
+                    values.get("reference_paths", []), ensure_ascii=False
+                ),
+                "asset_ids_json": json.dumps(
+                    values.get("asset_ids", []), ensure_ascii=False
+                ),
+                "variants_json": json.dumps(
+                    values.get("variants", []), ensure_ascii=False
+                ),
+                "tags_json": json.dumps(
+                    values.get("tags", []), ensure_ascii=False
+                ),
+                "created_at": existing["created_at"] if existing is not None else now,
+                "updated_at": now,
+            }
+            if existing is None:
+                columns = ", ".join(record)
+                placeholders = ", ".join(f":{column}" for column in record)
+                connection.execute(
+                    f"INSERT INTO library_items ({columns}) VALUES ({placeholders})",
+                    record,
+                )
+            else:
+                columns = [column for column in record if column not in {"id", "created_at"}]
+                assignments = ", ".join(f"{column} = :{column}" for column in columns)
+                connection.execute(
+                    f"UPDATE library_items SET {assignments} WHERE id = :id",
+                    record,
+                )
+            connection.commit()
+        return self.get_library_item(record["id"])
+
+    def get_library_item(self, item_id: str) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM library_items WHERE id = ?", (item_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(item_id)
+        return self._decode_library_item(row)
+
+    def list_library_items(
+        self,
+        *,
+        query: str = "",
+        source_kind: str = "",
+        stage: str = "",
+        metadata_quality: str = "",
+        qc_status: str = "",
+        sort: str = "newest",
+        limit: int = 60,
+        offset: int = 0,
+    ) -> tuple[list[dict[str, Any]], int]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if query.strip():
+            needle = f"%{query.strip()}%"
+            clauses.append(
+                "(name LIKE ? OR batch_name LIKE ? OR prompt LIKE ? OR file_name LIKE ?)"
+            )
+            params.extend([needle, needle, needle, needle])
+        for column, value in (
+            ("source_kind", source_kind),
+            ("stage", stage),
+            ("metadata_quality", metadata_quality),
+            ("qc_status", qc_status),
+        ):
+            if value:
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        order_by = {
+            "oldest": "modified_at ASC",
+            "name": "name COLLATE NOCASE ASC",
+        }.get(sort, "modified_at DESC")
+        with self._lock, self._connection() as connection:
+            total = int(
+                connection.execute(
+                    f"SELECT COUNT(*) FROM library_items {where}", params
+                ).fetchone()[0]
+            )
+            rows = connection.execute(
+                f"SELECT * FROM library_items {where} ORDER BY {order_by} LIMIT ? OFFSET ?",
+                (*params, limit, offset),
+            ).fetchall()
+        return [self._decode_library_item(row) for row in rows], total
+
+    def library_summary(self) -> dict[str, int]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                """
+                SELECT
+                    COUNT(*) total,
+                    SUM(CASE WHEN prompt <> '' THEN 1 ELSE 0 END) with_prompt,
+                    SUM(CASE WHEN metadata_quality = 'filename_only' THEN 1 ELSE 0 END) needs_metadata,
+                    SUM(CASE WHEN qc_status IN ('pass', 'passed', 'selected', 'selected_with_flag') THEN 1 ELSE 0 END) reviewed,
+                    SUM(CASE WHEN source_kind = 'managed' THEN 1 ELSE 0 END) managed
+                FROM library_items
+                """
+            ).fetchone()
+            paths = [
+                item[0]
+                for item in connection.execute("SELECT file_path FROM library_items")
+            ]
+        return {
+            "total": int(row["total"] or 0),
+            "with_prompt": int(row["with_prompt"] or 0),
+            "needs_metadata": int(row["needs_metadata"] or 0),
+            "reviewed": int(row["reviewed"] or 0),
+            "managed": int(row["managed"] or 0),
+            "playable": sum(Path(path).is_file() for path in paths),
+        }
+
+    def update_library_item(
+        self, item_id: str, changes: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not changes:
+            return self.get_library_item(item_id)
+        allowed = {"name", "prompt", "stage", "qc_status", "review_notes", "tags"}
+        unexpected = set(changes) - allowed
+        if unexpected:
+            raise ValueError(f"Unsupported library fields: {sorted(unexpected)}")
+        encoded = {
+            ("tags_json" if key == "tags" else key): (
+                json.dumps(value, ensure_ascii=False) if key == "tags" else value
+            )
+            for key, value in changes.items()
+        }
+        encoded["updated_at"] = utc_now()
+        assignments = ", ".join(f"{field} = :{field}" for field in encoded)
+        with self._lock, self._connection() as connection:
+            cursor = connection.execute(
+                f"UPDATE library_items SET {assignments} WHERE id = :id",
+                {**encoded, "id": item_id},
+            )
+            connection.commit()
+        if cursor.rowcount == 0:
+            raise KeyError(item_id)
+        return self.get_library_item(item_id)
+
+    def update_library_by_job(self, job_id: str, **changes: Any) -> None:
+        allowed = {"qc_status", "review_notes"}
+        encoded = {key: value for key, value in changes.items() if key in allowed}
+        if not encoded:
+            return
+        encoded["updated_at"] = utc_now()
+        assignments = ", ".join(f"{field} = :{field}" for field in encoded)
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                f"UPDATE library_items SET {assignments} WHERE job_id = :job_id",
+                {**encoded, "job_id": job_id},
+            )
+            connection.commit()
+
+    def known_library_paths(self) -> set[str]:
+        known: set[str] = set()
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT file_path, variants_json FROM library_items"
+            ).fetchall()
+        for row in rows:
+            known.add(str(Path(row["file_path"]).resolve()).lower())
+            for variant in json.loads(row["variants_json"] or "[]"):
+                if variant.get("path"):
+                    known.add(str(Path(variant["path"]).resolve()).lower())
+        return known
+
     @staticmethod
     def _night_run_metrics(
         connection: sqlite3.Connection, night_run_id: str
@@ -520,4 +776,13 @@ class JobStore:
             raw = result.pop(f"{field}_json", "[]")
             result[field] = json.loads(raw) if raw else []
         result.update(metrics)
+        return result
+
+    @staticmethod
+    def _decode_library_item(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        for field in ("reference_paths", "asset_ids", "variants", "tags"):
+            raw = result.pop(f"{field}_json", "[]")
+            result[field] = json.loads(raw) if raw else []
+        result["playable"] = Path(result["file_path"]).is_file()
         return result

@@ -13,6 +13,9 @@ AssetKind = Literal["character", "scene", "style", "prop", "audio", "custom"]
 AssetControl = Literal[
     "identity", "scene", "style", "prop", "audio", "reference"
 ]
+LibrarySourceKind = Literal["managed", "history", "discovered"]
+LibraryStage = Literal["preview", "raw", "enhanced", "release", "unknown"]
+LibraryMetadataQuality = Literal["complete", "partial", "filename_only"]
 
 
 class AssetCreate(BaseModel):
@@ -220,6 +223,80 @@ class NightRunResponse(BaseModel):
 
 class NightRunStatusRequest(BaseModel):
     status: NightRunStatus
+
+
+class LibraryVariant(BaseModel):
+    kind: str
+    label: str
+    path: str
+
+
+class LibraryItemResponse(BaseModel):
+    id: str
+    source_kind: LibrarySourceKind
+    source_key: str
+    job_id: str | None = None
+    name: str
+    batch_name: str
+    file_path: str
+    file_name: str
+    media_type: str
+    size_bytes: int
+    modified_at: str
+    prompt: str
+    mode: str
+    stage: LibraryStage
+    seed: int | None = None
+    width: int | None = None
+    height: int | None = None
+    duration_seconds: float | None = None
+    fps: float | None = None
+    qc_status: str
+    review_notes: str
+    metadata_quality: LibraryMetadataQuality
+    reference_paths: list[str]
+    asset_ids: list[str]
+    variants: list[LibraryVariant]
+    tags: list[str]
+    playable: bool
+    created_at: str
+    updated_at: str
+
+
+class LibraryUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=160)
+    prompt: str | None = Field(default=None, max_length=16000)
+    stage: LibraryStage | None = None
+    qc_status: str | None = Field(default=None, max_length=40)
+    review_notes: str | None = Field(default=None, max_length=4000)
+    tags: list[str] | None = Field(default=None, max_length=30)
+
+    @field_validator("name", "qc_status")
+    @classmethod
+    def strip_library_short_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return value
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("不能为空")
+        return normalized
+
+    @field_validator("tags")
+    @classmethod
+    def normalize_library_tags(cls, values: list[str] | None) -> list[str] | None:
+        if values is None:
+            return None
+        normalized: list[str] = []
+        for value in values:
+            tag = value.strip()
+            if tag and tag not in normalized:
+                normalized.append(tag[:40])
+        return normalized
+
+
+class LibrarySyncRequest(BaseModel):
+    mode: Literal["history", "files", "all"] = "all"
+    limit: int = Field(default=500, ge=1, le=5000)
 
 
 class WorkflowValidateRequest(BaseModel):

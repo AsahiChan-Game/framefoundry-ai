@@ -167,6 +167,53 @@ class AssetApiTests(unittest.TestCase):
             finally:
                 main.store = original_store
 
+    def test_library_scans_only_configured_root_and_serves_registered_file(self) -> None:
+        original_store = main.store
+        original_roots = main.LIBRARY_ROOTS
+        original_history = main.HISTORY_DATABASE_PATH
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video_path = root / "videos" / "raw" / "legacy-clip.mp4"
+            video_path.parent.mkdir(parents=True)
+            video_path.write_bytes(b"fake-video-bytes")
+            main.store = JobStore(root / "api.db")
+            main.LIBRARY_ROOTS = (root.resolve(),)
+            main.HISTORY_DATABASE_PATH = None
+            try:
+                with TestClient(main.app) as client:
+                    synced = client.post(
+                        "/api/library/sync", json={"mode": "files", "limit": 20}
+                    )
+                    self.assertEqual(synced.status_code, 200, synced.text)
+                    self.assertEqual(synced.json()["result"]["files"]["processed"], 1)
+
+                    listing = client.get("/api/library").json()
+                    self.assertEqual(listing["total"], 1)
+                    item = listing["items"][0]
+                    self.assertEqual(item["metadata_quality"], "filename_only")
+                    self.assertEqual(item["stage"], "raw")
+
+                    content = client.get(f"/api/library/{item['id']}/content")
+                    self.assertEqual(content.status_code, 200)
+                    self.assertEqual(content.content, b"fake-video-bytes")
+
+                    updated = client.patch(
+                        f"/api/library/{item['id']}",
+                        json={
+                            "name": "已整理旧片",
+                            "prompt": "补录的提示词",
+                            "qc_status": "selected",
+                            "tags": ["收藏"],
+                        },
+                    )
+                    self.assertEqual(updated.status_code, 200, updated.text)
+                    self.assertEqual(updated.json()["name"], "已整理旧片")
+                    self.assertEqual(updated.json()["tags"], ["收藏"])
+            finally:
+                main.store = original_store
+                main.LIBRARY_ROOTS = original_roots
+                main.HISTORY_DATABASE_PATH = original_history
+
 
 if __name__ == "__main__":
     unittest.main()

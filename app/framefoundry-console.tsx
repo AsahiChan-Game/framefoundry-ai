@@ -12,14 +12,19 @@ import {
   Clock3,
   Clapperboard,
   CloudOff,
+  Copy,
   Cpu,
+  Database,
   FileJson,
   Film,
+  FolderSearch,
   FolderOpen,
   Gauge,
   Grid2X2,
+  HardDrive,
   Image as ImageIcon,
   ImagePlus,
+  Info,
   Layers3,
   LayoutDashboard,
   LoaderCircle,
@@ -34,6 +39,7 @@ import {
   Plus,
   PackageOpen,
   RefreshCw,
+  Save,
   Search,
   Server,
   Settings,
@@ -41,6 +47,7 @@ import {
   SlidersHorizontal,
   Sparkles,
   Square,
+  Tag,
   TerminalSquare,
   ThumbsDown,
   ThumbsUp,
@@ -52,7 +59,7 @@ import {
 import type { LucideIcon } from "lucide-react";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
-type Section = "create" | "night" | "queue" | "workflows" | "assets" | "nodes";
+type Section = "create" | "night" | "queue" | "library" | "workflows" | "assets" | "nodes";
 type NodeState = "online" | "offline" | "checking";
 type JobState = "queued" | "running" | "completed" | "failed" | "cancelled";
 type ProductionStage = "manual" | "preview" | "final";
@@ -148,10 +155,74 @@ type Asset = {
   updated_at: string;
 };
 
+type LibraryVariant = {
+  kind: string;
+  label: string;
+  path: string;
+};
+
+type LibraryItem = {
+  id: string;
+  source_kind: "managed" | "history" | "discovered";
+  source_key: string;
+  job_id?: string | null;
+  name: string;
+  batch_name: string;
+  file_path: string;
+  file_name: string;
+  media_type: string;
+  size_bytes: number;
+  modified_at: string;
+  prompt: string;
+  mode: string;
+  stage: "preview" | "raw" | "enhanced" | "release" | "unknown";
+  seed?: number | null;
+  width?: number | null;
+  height?: number | null;
+  duration_seconds?: number | null;
+  fps?: number | null;
+  qc_status: string;
+  review_notes: string;
+  metadata_quality: "complete" | "partial" | "filename_only";
+  reference_paths: string[];
+  asset_ids: string[];
+  variants: LibraryVariant[];
+  tags: string[];
+  playable: boolean;
+  created_at: string;
+  updated_at: string;
+};
+
+type LibrarySummary = {
+  total: number;
+  playable: number;
+  with_prompt: number;
+  needs_metadata: number;
+  reviewed: number;
+  managed: number;
+};
+
+type LibrarySource = {
+  id: string;
+  label: string;
+  path: string;
+  kind: "database" | "folder";
+  available: boolean;
+};
+
 type ApiState = "connecting" | "online" | "offline";
 
 const API_BASE =
   process.env.NEXT_PUBLIC_FRAMEFOUNDRY_API_URL ?? "http://127.0.0.1:8766/api";
+
+const EMPTY_LIBRARY_SUMMARY: LibrarySummary = {
+  total: 0,
+  playable: 0,
+  with_prompt: 0,
+  needs_metadata: 0,
+  reviewed: 0,
+  managed: 0,
+};
 
 const NAV_ITEMS: Array<{
   id: Section;
@@ -162,6 +233,7 @@ const NAV_ITEMS: Array<{
   { id: "create", label: "创作台", sublabel: "Create", icon: LayoutDashboard },
   { id: "night", label: "守夜监制", sublabel: "Night Supervisor", icon: MoonStar },
   { id: "queue", label: "任务队列", sublabel: "Queue", icon: Layers3 },
+  { id: "library", label: "成片库", sublabel: "Clip Library", icon: Clapperboard },
   { id: "workflows", label: "工作流", sublabel: "Workflows", icon: Boxes },
   { id: "assets", label: "素材库", sublabel: "Assets", icon: FolderOpen },
   { id: "nodes", label: "节点监控", sublabel: "Nodes", icon: MonitorDot },
@@ -233,6 +305,42 @@ function formatTime(value: string) {
   }).format(date);
 }
 
+function formatFileSize(value: number) {
+  if (!value) return "—";
+  if (value < 1024 * 1024) return `${Math.max(1, Math.round(value / 1024))} KB`;
+  return `${(value / (1024 * 1024)).toFixed(value > 100 * 1024 * 1024 ? 0 : 1)} MB`;
+}
+
+function libraryStageLabel(stage: LibraryItem["stage"]) {
+  return {
+    preview: "样片",
+    raw: "原片",
+    enhanced: "增强片",
+    release: "发布版",
+    unknown: "待判断",
+  }[stage];
+}
+
+function librarySourceLabel(source: LibraryItem["source_kind"]) {
+  return {
+    managed: "系统新片",
+    history: "历史记录",
+    discovered: "发现旧片",
+  }[source];
+}
+
+function libraryQualityLabel(quality: LibraryItem["metadata_quality"]) {
+  return {
+    complete: "资料完整",
+    partial: "部分恢复",
+    filename_only: "待补资料",
+  }[quality];
+}
+
+function basename(value: string) {
+  return value.split(/[\\/]/).filter(Boolean).pop() ?? value;
+}
+
 function jobStatusLabel(status: JobState) {
   return {
     queued: "排队中",
@@ -263,6 +371,7 @@ export function FrameFoundryConsole() {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [assets, setAssets] = useState<Asset[]>([]);
   const [nightRuns, setNightRuns] = useState<NightRun[]>([]);
+  const [librarySummary, setLibrarySummary] = useState<LibrarySummary>(EMPTY_LIBRARY_SUMMARY);
   const [selectedAssetIds, setSelectedAssetIds] = useState<string[]>([]);
   const [prompt, setPrompt] = useState(
     "一只橘猫在无尽的荧光灯走廊中谨慎前行，低机位跟拍，空气中有轻微尘埃，环境压抑但不恐怖，连续单镜头。",
@@ -296,6 +405,17 @@ export function FrameFoundryConsole() {
     if (!response.ok) throw new Error("night run request was not successful");
     const payload = (await response.json()) as { night_runs: NightRun[] };
     setNightRuns(payload.night_runs);
+  }, []);
+
+  const refreshLibrarySummary = useCallback(async () => {
+    try {
+      const response = await fetch(`${API_BASE}/library?limit=1`, { cache: "no-store" });
+      if (!response.ok) return;
+      const payload = (await response.json()) as { summary: LibrarySummary };
+      setLibrarySummary(payload.summary);
+    } catch {
+      // The primary runtime poll owns the visible API state.
+    }
   }, []);
 
   const fetchRuntime = useCallback(async () => {
@@ -332,15 +452,17 @@ export function FrameFoundryConsole() {
   useEffect(() => {
     const initial = window.setTimeout(() => {
       void fetchRuntime();
+      void refreshLibrarySummary();
     }, 0);
     const interval = window.setInterval(() => {
       void fetchRuntime();
+      void refreshLibrarySummary();
     }, 15000);
     return () => {
       window.clearTimeout(initial);
       window.clearInterval(interval);
     };
-  }, [fetchRuntime]);
+  }, [fetchRuntime, refreshLibrarySummary]);
 
   useEffect(() => {
     const interval = window.setInterval(async () => {
@@ -606,6 +728,7 @@ export function FrameFoundryConsole() {
                 </span>
                 {item.id === "queue" && jobs.length > 0 ? <b>{jobs.length}</b> : null}
                 {item.id === "night" && nightRuns.reduce((total, run) => total + run.awaiting_review_count, 0) > 0 ? <b>{nightRuns.reduce((total, run) => total + run.awaiting_review_count, 0)}</b> : null}
+                {item.id === "library" && librarySummary.total > 0 ? <b>{librarySummary.total > 999 ? "999+" : librarySummary.total}</b> : null}
               </button>
             );
           })}
@@ -696,6 +819,12 @@ export function FrameFoundryConsole() {
           ) : null}
           {section === "queue" ? (
             <QueueView jobs={filteredJobs} filter={queueFilter} setFilter={setQueueFilter} cancelJob={cancelJob} openCreate={() => setSection("create")} />
+          ) : null}
+          {section === "library" ? (
+            <LibraryView
+              announce={setNotice}
+              onSummary={setLibrarySummary}
+            />
           ) : null}
           {section === "workflows" ? <WorkflowView openCreate={() => setSection("create")} /> : null}
           {section === "assets" ? (
@@ -1321,6 +1450,227 @@ function AssetsView({ assets, selectedAssetIds, toggleAsset, openCreate, refresh
         )}
         {selectedAssetIds.length ? <div className="asset-selection-bar"><span><Check size={15} />已选择 {selectedAssetIds.length} 个资产，可通过 <code>{"{{reference_paths}}"}</code> 传给 H3</span><button className="primary-button" onClick={openCreate}><Play size={15} />返回创作台</button></div> : null}
       </section>
+    </>
+  );
+}
+
+function LibraryView({ announce, onSummary }: { announce: (message: string) => void; onSummary: (summary: LibrarySummary) => void }) {
+  const [items, setItems] = useState<LibraryItem[]>([]);
+  const [summary, setSummary] = useState<LibrarySummary>(EMPTY_LIBRARY_SUMMARY);
+  const [sources, setSources] = useState<LibrarySource[]>([]);
+  const [total, setTotal] = useState(0);
+  const [query, setQuery] = useState("");
+  const [sourceKind, setSourceKind] = useState("");
+  const [stage, setStage] = useState("");
+  const [quality, setQuality] = useState("");
+  const [sort, setSort] = useState("newest");
+  const [loading, setLoading] = useState(true);
+  const [syncing, setSyncing] = useState<"history" | "files" | null>(null);
+  const [selected, setSelected] = useState<LibraryItem | null>(null);
+  const [selectedVariant, setSelectedVariant] = useState("");
+  const [editName, setEditName] = useState("");
+  const [editPrompt, setEditPrompt] = useState("");
+  const [editQc, setEditQc] = useState("unreviewed");
+  const [editNotes, setEditNotes] = useState("");
+  const [editTags, setEditTags] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const refreshLibrary = useCallback(async () => {
+    setLoading(true);
+    try {
+      const params = new URLSearchParams({ limit: "24", sort });
+      if (query.trim()) params.set("query", query.trim());
+      if (sourceKind) params.set("source_kind", sourceKind);
+      if (stage) params.set("stage", stage);
+      if (quality) params.set("metadata_quality", quality);
+      const response = await fetch(`${API_BASE}/library?${params}`, { cache: "no-store" });
+      if (!response.ok) throw new Error("library request failed");
+      const payload = (await response.json()) as {
+        items: LibraryItem[];
+        total: number;
+        summary: LibrarySummary;
+        sources: LibrarySource[];
+      };
+      setItems(payload.items);
+      setTotal(payload.total);
+      setSummary(payload.summary);
+      setSources(payload.sources);
+      onSummary(payload.summary);
+    } catch {
+      announce("成片库读取失败，请确认本地控制 API 已更新并启动。");
+    } finally {
+      setLoading(false);
+    }
+  }, [announce, onSummary, quality, query, sort, sourceKind, stage]);
+
+  useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      void refreshLibrary();
+    }, query ? 220 : 0);
+    return () => window.clearTimeout(timeout);
+  }, [refreshLibrary, query]);
+
+  async function syncLibrary(mode: "history" | "files") {
+    setSyncing(mode);
+    try {
+      const response = await fetch(`${API_BASE}/library/sync`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ mode, limit: mode === "files" ? 500 : 5000 }),
+      });
+      if (!response.ok) throw new Error("library sync failed");
+      const payload = (await response.json()) as { result: Record<string, { processed?: number; skipped?: number }> };
+      const result = payload.result[mode];
+      announce(mode === "history" ? `历史记录同步完成：恢复 ${result?.processed ?? 0} 条。` : `旧片扫描完成：新增 ${result?.processed ?? 0} 条，已知文件自动跳过。`);
+      await refreshLibrary();
+    } catch {
+      announce(mode === "history" ? "历史记录同步失败，请检查配置的数据库路径。" : "旧片扫描失败，请检查配置的片库目录。");
+    } finally {
+      setSyncing(null);
+    }
+  }
+
+  function openItem(item: LibraryItem) {
+    setSelected(item);
+    setSelectedVariant(item.variants.find((variant) => variant.path === item.file_path)?.kind ?? "");
+    setEditName(item.name);
+    setEditPrompt(item.prompt);
+    setEditQc(item.qc_status);
+    setEditNotes(item.review_notes);
+    setEditTags(item.tags.join("，"));
+  }
+
+  async function saveItem() {
+    if (!selected || !editName.trim()) return;
+    setSaving(true);
+    try {
+      const response = await fetch(`${API_BASE}/library/${encodeURIComponent(selected.id)}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: editName.trim(),
+          prompt: editPrompt.trim(),
+          qc_status: editQc,
+          review_notes: editNotes.trim(),
+          tags: editTags.split(/[，,]/).map((tag) => tag.trim()).filter(Boolean),
+        }),
+      });
+      if (!response.ok) throw new Error("library update failed");
+      const updated = (await response.json()) as LibraryItem;
+      setSelected(updated);
+      setItems((current) => current.map((item) => item.id === updated.id ? updated : item));
+      announce("成片资料已更新，不会改动原视频文件。");
+    } catch {
+      announce("成片资料保存失败，请稍后重试。");
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function copyPrompt() {
+    if (!selected?.prompt) return;
+    try {
+      await navigator.clipboard.writeText(selected.prompt);
+      announce("提示词已复制。");
+    } catch {
+      announce("浏览器未允许复制，请在详情中手动选择提示词。");
+    }
+  }
+
+  const selectedContentUrl = selected
+    ? `${API_BASE}/library/${encodeURIComponent(selected.id)}/content${selectedVariant ? `?variant=${encodeURIComponent(selectedVariant)}` : ""}`
+    : "";
+
+  return (
+    <>
+      <SectionHeading
+        eyebrow="LOCAL CLIP LIBRARY"
+        title="成片库"
+        description="直接预览本地成片，把提示词、参考素材、生成阶段和审核结论重新连回每一条视频。"
+        action={(
+          <>
+            <button className="secondary-button" disabled={syncing !== null} onClick={() => { void syncLibrary("history"); }}><Database size={16} />{syncing === "history" ? "正在同步…" : "同步历史记录"}</button>
+            <button className="primary-button" disabled={syncing !== null} onClick={() => { void syncLibrary("files"); }}><FolderSearch size={16} />{syncing === "files" ? "正在扫描…" : "发现最近旧片"}</button>
+          </>
+        )}
+      />
+
+      <section className="metrics-grid library-metrics" aria-label="成片库概览">
+        <MetricCard label="已登记" value={String(summary.total).padStart(2, "0")} suffix="条" icon={Clapperboard} tone="purple" detail="记录不会移动原文件" />
+        <MetricCard label="可直接播放" value={String(summary.playable).padStart(2, "0")} suffix="条" icon={Play} tone="green" detail="文件仍在原位置" />
+        <MetricCard label="带提示词" value={String(summary.with_prompt).padStart(2, "0")} suffix="条" icon={FileJson} tone="blue" detail="可复制复用与检索" />
+        <MetricCard label="待补资料" value={String(summary.needs_metadata).padStart(2, "0")} suffix="条" icon={Info} tone="amber" detail="仅有文件名的旧片" />
+      </section>
+
+      <section className="panel library-source-strip" aria-label="成片来源">
+        <div><HardDrive size={18} /><span><strong>只读来源</strong><small>旧片保持原位；新片完成后自动登记</small></span></div>
+        <div className="library-source-list">
+          {sources.map((source) => <span className={source.available ? "available" : "missing"} key={source.id} title={source.path}><i />{source.label}</span>)}
+          {!sources.length ? <span className="missing"><i />尚未配置历史目录</span> : null}
+        </div>
+      </section>
+
+      <section className="panel view-panel clip-library-panel">
+        <div className="clip-toolbar">
+          <label className="asset-search clip-search"><Search size={15} /><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索片名、批次或提示词…" /></label>
+          <select aria-label="片库来源" value={sourceKind} onChange={(event) => setSourceKind(event.target.value)}><option value="">全部来源</option><option value="managed">系统新片</option><option value="history">历史记录</option><option value="discovered">发现旧片</option></select>
+          <select aria-label="成片阶段" value={stage} onChange={(event) => setStage(event.target.value)}><option value="">全部阶段</option><option value="preview">样片</option><option value="raw">原片</option><option value="enhanced">增强片</option><option value="release">发布版</option><option value="unknown">待判断</option></select>
+          <select aria-label="资料完整度" value={quality} onChange={(event) => setQuality(event.target.value)}><option value="">全部资料状态</option><option value="complete">资料完整</option><option value="partial">部分恢复</option><option value="filename_only">待补资料</option></select>
+          <select aria-label="成片排序" value={sort} onChange={(event) => setSort(event.target.value)}><option value="newest">最近生成</option><option value="oldest">最早生成</option><option value="name">名称排序</option></select>
+          <span className="clip-result-count">显示 {items.length}/{total}</span>
+        </div>
+
+        {loading ? (
+          <div className="library-loading"><LoaderCircle className="spin" size={22} />正在整理片库…</div>
+        ) : items.length ? (
+          <div className="clip-grid">
+            {items.map((item) => (
+              <article className="clip-card" key={item.id}>
+                <div className="clip-preview">
+                  {item.playable ? <video src={`${API_BASE}/library/${encodeURIComponent(item.id)}/content`} preload="metadata" muted playsInline><track kind="captions" src="data:text/vtt,WEBVTT%0A%0A" srcLang="zh" label="无字幕" /></video> : <div className="clip-missing"><Film size={26} /><span>文件已移动</span></div>}
+                  <span className={classNames("clip-stage", item.stage)}>{libraryStageLabel(item.stage)}</span>
+                  <button onClick={() => openItem(item)} aria-label={`预览 ${item.name}`}><Play size={18} fill="currentColor" /></button>
+                </div>
+                <div className="clip-card-body">
+                  <div className="clip-title-row"><strong title={item.name}>{item.name}</strong><span className={classNames("clip-quality", item.metadata_quality)}>{libraryQualityLabel(item.metadata_quality)}</span></div>
+                  <p className="clip-batch" title={item.batch_name}>{item.batch_name || "未分批次"}</p>
+                  <p className={item.prompt ? "clip-prompt" : "clip-prompt empty"}>{item.prompt || "只有文件名；可在详情里补录提示词与评价。"}</p>
+                  <div className="clip-meta"><span>{item.mode || librarySourceLabel(item.source_kind)}</span><span>{item.width && item.height ? `${item.width}×${item.height}` : formatFileSize(item.size_bytes)}</span><span>{formatTime(item.modified_at)}</span></div>
+                  <button className="clip-detail-button" onClick={() => openItem(item)}><Info size={14} />查看提示词与素材</button>
+                </div>
+              </article>
+            ))}
+          </div>
+        ) : (
+          <EmptyState icon={Clapperboard} title="还没有可显示的成片" description="先同步已有生产记录；需要时再扫描最近旧片，不必一次整理全部历史目录。" action="同步历史记录" onAction={() => { void syncLibrary("history"); }} />
+        )}
+      </section>
+
+      {selected ? (
+        <div className="clip-modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setSelected(null); }}>
+          <section className="clip-detail-modal" role="dialog" aria-modal="true" aria-label={`${selected.name} 成片详情`}>
+            <div className="clip-detail-head"><div><span className="panel-kicker">CLIP RECORD</span><h2>{selected.name}</h2><p>{librarySourceLabel(selected.source_kind)} · {selected.batch_name || "未分批次"}</p></div><button className="icon-button" onClick={() => setSelected(null)} aria-label="关闭成片详情"><X size={17} /></button></div>
+            <div className="clip-detail-layout">
+              <div className="clip-player-column">
+                <div className="clip-player">{selected.playable ? <video key={selectedContentUrl} src={selectedContentUrl} controls preload="metadata" playsInline><track kind="captions" src="data:text/vtt,WEBVTT%0A%0A" srcLang="zh" label="无字幕" /></video> : <div className="clip-missing"><Film size={32} /><span>原文件已移动，记录仍然保留</span></div>}</div>
+                {selected.variants.length > 1 ? <div className="clip-variants"><strong>可用阶段</strong><div>{selected.variants.map((variant) => <button className={selectedVariant === variant.kind ? "active" : ""} key={`${variant.kind}-${variant.path}`} onClick={() => setSelectedVariant(variant.kind)}>{variant.label}</button>)}</div></div> : null}
+                <dl className="clip-facts">
+                  <div><dt>阶段</dt><dd>{libraryStageLabel(selected.stage)}</dd></div><div><dt>模式</dt><dd>{selected.mode || "未知"}</dd></div><div><dt>Seed</dt><dd>{selected.seed ?? "—"}</dd></div><div><dt>画幅</dt><dd>{selected.width && selected.height ? `${selected.width}×${selected.height}` : "—"}</dd></div><div><dt>时长</dt><dd>{selected.duration_seconds ? `${selected.duration_seconds.toFixed(1)}s` : "—"}</dd></div><div><dt>帧率</dt><dd>{selected.fps ? `${selected.fps} fps` : "—"}</dd></div><div><dt>大小</dt><dd>{formatFileSize(selected.size_bytes)}</dd></div><div><dt>文件</dt><dd title={selected.file_path}>{selected.file_name}</dd></div>
+                </dl>
+                <div className="clip-references"><strong>关联素材</strong>{selected.reference_paths.length ? selected.reference_paths.map((path) => <span key={path} title={path}><ImageIcon size={13} />{basename(path)}</span>) : <p>历史记录中没有可恢复的参考素材路径。</p>}</div>
+              </div>
+              <div className="clip-record-column">
+                <label className="field"><span>片名 <em>Name</em></span><input value={editName} onChange={(event) => setEditName(event.target.value)} /></label>
+                <label className="field clip-prompt-editor"><span>生成提示词 <em>Prompt</em><button type="button" onClick={() => { void copyPrompt(); }} disabled={!selected.prompt}><Copy size={13} />复制</button></span><textarea value={editPrompt} onChange={(event) => setEditPrompt(event.target.value)} placeholder="旧片若无法自动恢复，可以在这里补录；新片会自动保存。" /></label>
+                <div className="clip-edit-row"><label className="field"><span>审核状态 <em>QC</em></span><select value={editQc} onChange={(event) => setEditQc(event.target.value)}><option value="unreviewed">未审核</option><option value="needs_review">待审核</option><option value="review">复核中</option><option value="pass">通过</option><option value="selected">精选</option><option value="selected_with_flag">精选（有备注）</option><option value="not_official">非正式候选</option><option value="rejected">淘汰</option></select></label><label className="field"><span>标签 <em>Tags</em></span><input value={editTags} onChange={(event) => setEditTags(event.target.value)} placeholder="收藏，梦核，竖屏" /></label></div>
+                <label className="field clip-notes-editor"><span>复盘与评价 <em>Review notes</em></span><textarea value={editNotes} onChange={(event) => setEditNotes(event.target.value)} placeholder="记录好在哪里、哪里不行、是否值得复用。" /></label>
+                <div className="clip-path-note"><Tag size={15} /><span><strong>{libraryQualityLabel(selected.metadata_quality)}</strong><small title={selected.file_path}>{selected.file_path}</small></span></div>
+                <div className="clip-detail-actions"><button className="secondary-button" onClick={() => setSelected(null)}>关闭</button><button className="primary-button" disabled={saving || !editName.trim()} onClick={() => { void saveItem(); }}>{saving ? <LoaderCircle className="spin" size={15} /> : <Save size={15} />}{saving ? "正在保存…" : "保存资料"}</button></div>
+              </div>
+            </div>
+          </section>
+        </div>
+      ) : null}
     </>
   );
 }

@@ -18,6 +18,8 @@ Version `v1.0.0` is an independent project. It is not a MoneyPrinterTurbo fork a
 
 The `1.1` development branch includes a **Night Supervisor** MVP: overnight plans generate review-gated previews first, and only an approved preview can unlock a final task. Preview/final budgets, cutoffs, and consecutive-failure circuit breakers are enforced by the local API.
 
+The development branch also includes a local **Clip Library**. It can preview registered videos, recover prompts and QC metadata from an existing read-only production-history database, and discover untracked files only from explicitly configured folders. Legacy files are never moved or copied.
+
 ## What 1.0 includes
 
 - A Chinese-first Web console for T2VA, I2VA, FL2VA, and Ref2VA tasks.
@@ -29,6 +31,7 @@ The `1.1` development branch includes a **Night Supervisor** MVP: overnight plan
 - Windows scripts for starting the Web console and local FastAPI service together.
 - A local asset center for reusable character, scene, style, prop, audio, and custom references.
 - A review-gated Night Supervisor flow for safer unattended batches.
+- A searchable local Clip Library with playable videos, prompts, references, stages, variants, and QC notes.
 
 ## Quick start (Windows)
 
@@ -66,6 +69,7 @@ npm test
 - Real mode tracks one ComfyUI workflow. Cross-service orchestration across `8189`–`8191` is planned for a later release.
 - Cancelling a submitted real task stops FrameFoundry tracking but does not call ComfyUI's global `/interrupt` endpoint.
 - The Night Supervisor MVP provides deterministic budgets, review gates, and circuit breaking. Automated visual/semantic taste scoring is not presented as complete yet.
+- Legacy clip discovery is intentionally partial: files without trustworthy metadata remain marked as filename-only records instead of receiving invented prompts.
 
 See the [Chinese README](README.md) for full API, workflow placeholder, storage, and architecture documentation.
 

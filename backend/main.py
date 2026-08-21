@@ -25,13 +25,24 @@ from .comfyui import (
 from .config import (
     ASSET_DIR,
     DATABASE_PATH,
+    HISTORY_DATABASE_PATH,
+    LIBRARY_ROOTS,
     MAX_REFERENCE_BYTES,
     NODES,
+    NODE_OUTPUT_DIRS,
     OUTPUT_DIR,
     REAL_JOB_TIMEOUT_SECONDS,
     UPLOAD_DIR,
     NodeConfig,
     prepare_directories,
+)
+from .library import (
+    VIDEO_MEDIA_TYPES,
+    is_path_allowed,
+    register_managed_job_output,
+    resolve_comfyui_output,
+    scan_library_roots,
+    sync_history_database,
 )
 from .models import (
     AssetCreate,
@@ -40,6 +51,9 @@ from .models import (
     JobCreate,
     JobReviewRequest,
     JobResponse,
+    LibraryItemResponse,
+    LibrarySyncRequest,
+    LibraryUpdate,
     NightRunCreate,
     NightRunResponse,
     NightRunStatusRequest,
@@ -83,6 +97,39 @@ def public_asset(record: dict[str, Any]) -> AssetResponse:
 
 def public_night_run(record: dict[str, Any]) -> NightRunResponse:
     return NightRunResponse.model_validate(record)
+
+
+def public_library_item(record: dict[str, Any]) -> LibraryItemResponse:
+    return LibraryItemResponse.model_validate(record)
+
+
+def library_allowed_roots() -> tuple[Path, ...]:
+    return tuple(dict.fromkeys((*LIBRARY_ROOTS, *NODE_OUTPUT_DIRS.values())))
+
+
+def library_sources() -> list[dict[str, Any]]:
+    sources: list[dict[str, Any]] = []
+    if HISTORY_DATABASE_PATH is not None:
+        sources.append(
+            {
+                "id": "history",
+                "label": "历史生产记录",
+                "path": str(HISTORY_DATABASE_PATH),
+                "kind": "database",
+                "available": HISTORY_DATABASE_PATH.is_file(),
+            }
+        )
+    for index, root in enumerate(LIBRARY_ROOTS):
+        sources.append(
+            {
+                "id": f"root-{index + 1}",
+                "label": "新片输出" if root == OUTPUT_DIR else f"历史目录 · {root.name}",
+                "path": str(root),
+                "kind": "folder",
+                "available": root.is_dir(),
+            }
+        )
+    return sources
 
 
 def _safe_filename(filename: str) -> str:
@@ -299,12 +346,22 @@ async def run_real_job(job: dict[str, Any]) -> None:
     if is_cancelled(job["id"]):
         return
     output_files = extract_output_files(history)
-    output_path = (
-        f"comfyui://{target.id}/{output_files[0]}"
-        if output_files
-        else f"comfyui://{target.id}/history/{prompt_id}"
+    local_output_path = resolve_comfyui_output(
+        output_files,
+        job_id=job["id"],
+        output_root=OUTPUT_DIR,
+        node_output_root=NODE_OUTPUT_DIRS.get(target.id),
     )
-    store.update(
+    output_path = (
+        str(local_output_path)
+        if local_output_path is not None
+        else (
+            f"comfyui://{target.id}/{output_files[0]}"
+            if output_files
+            else f"comfyui://{target.id}/history/{prompt_id}"
+        )
+    )
+    completed_job = store.update(
         job["id"],
         status="completed",
         progress=100,
@@ -315,6 +372,8 @@ async def run_real_job(job: dict[str, Any]) -> None:
         ),
         output_path=output_path,
     )
+    if local_output_path is not None:
+        register_managed_job_output(store, completed_job, local_output_path)
 
 
 async def queue_dispatcher() -> None:
@@ -375,7 +434,7 @@ app.add_middleware(
         "http://localhost:5173",
     ],
     allow_credentials=False,
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
     allow_headers=["Content-Type"],
 )
 
@@ -448,6 +507,110 @@ async def import_asset_pack(payload: AssetPackImport) -> dict[str, Any]:
         "imported_count": len(imported),
         "assets": imported,
     }
+
+
+@app.get("/api/library")
+async def list_library_items(
+    query: str = Query(default="", max_length=200),
+    source_kind: str = Query(default="", max_length=30),
+    stage: str = Query(default="", max_length=30),
+    metadata_quality: str = Query(default="", max_length=30),
+    qc_status: str = Query(default="", max_length=40),
+    sort: str = Query(default="newest", max_length=20),
+    limit: int = Query(default=60, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> dict[str, Any]:
+    items, total = store.list_library_items(
+        query=query,
+        source_kind=source_kind,
+        stage=stage,
+        metadata_quality=metadata_quality,
+        qc_status=qc_status,
+        sort=sort,
+        limit=limit,
+        offset=offset,
+    )
+    return {
+        "items": [public_library_item(item) for item in items],
+        "total": total,
+        "summary": store.library_summary(),
+        "sources": library_sources(),
+    }
+
+
+@app.get("/api/library/{item_id}", response_model=LibraryItemResponse)
+async def get_library_item(item_id: str) -> LibraryItemResponse:
+    try:
+        return public_library_item(store.get_library_item(item_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="成片记录不存在") from exc
+
+
+@app.get("/api/library/{item_id}/content")
+async def get_library_content(
+    item_id: str,
+    variant: str = Query(default="", max_length=40),
+) -> FileResponse:
+    try:
+        item = store.get_library_item(item_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="成片记录不存在") from exc
+    selected_path = item["file_path"]
+    if variant:
+        selected = next(
+            (value for value in item["variants"] if value.get("kind") == variant),
+            None,
+        )
+        if selected is None:
+            raise HTTPException(status_code=404, detail="成片阶段不存在")
+        selected_path = selected["path"]
+    resolved_path = Path(selected_path).resolve()
+    if (
+        resolved_path.suffix.lower() not in VIDEO_MEDIA_TYPES
+        or not is_path_allowed(resolved_path, library_allowed_roots())
+        or not resolved_path.is_file()
+    ):
+        raise HTTPException(status_code=404, detail="成片文件不可播放或已经移动")
+    return FileResponse(
+        resolved_path,
+        media_type=VIDEO_MEDIA_TYPES.get(resolved_path.suffix.lower(), "video/mp4"),
+        filename=resolved_path.name,
+        content_disposition_type="inline",
+    )
+
+
+@app.patch("/api/library/{item_id}", response_model=LibraryItemResponse)
+async def update_library_item(
+    item_id: str, payload: LibraryUpdate
+) -> LibraryItemResponse:
+    changes = payload.model_dump(exclude_none=True)
+    try:
+        return public_library_item(store.update_library_item(item_id, changes))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="成片记录不存在") from exc
+
+
+@app.post("/api/library/sync")
+async def sync_library(payload: LibrarySyncRequest) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    try:
+        if payload.mode in {"history", "all"}:
+            result["history"] = await asyncio.to_thread(
+                sync_history_database,
+                store,
+                HISTORY_DATABASE_PATH,
+                LIBRARY_ROOTS,
+            )
+        if payload.mode in {"files", "all"}:
+            result["files"] = await asyncio.to_thread(
+                scan_library_roots,
+                store,
+                LIBRARY_ROOTS,
+                limit=payload.limit,
+            )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"result": result, "summary": store.library_summary()}
 
 
 @app.get("/api/night-runs")
@@ -566,7 +729,13 @@ async def create_job(payload: JobCreate) -> JobResponse:
 @app.post("/api/jobs/{job_id}/review", response_model=JobResponse)
 async def review_job(job_id: str, payload: JobReviewRequest) -> JobResponse:
     try:
-        return public_job(store.review_preview(job_id, payload.decision, payload.reasons))
+        reviewed = store.review_preview(job_id, payload.decision, payload.reasons)
+        store.update_library_by_job(
+            job_id,
+            qc_status=reviewed["review_status"],
+            review_notes=" · ".join(reviewed["review_reasons"]),
+        )
+        return public_job(reviewed)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="任务不存在") from exc
     except ValueError as exc:
