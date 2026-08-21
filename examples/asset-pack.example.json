@@ -1,0 +1,22 @@
+{
+  "pack_name": "后室探索基础资产",
+  "version": "1.0",
+  "assets": [
+    {
+      "name": "橘猫主角",
+      "kind": "character",
+      "description": "用于保持主角毛色、体型和身份特征一致。",
+      "tags": ["角色", "橘猫", "主角"],
+      "prompt_hint": "同一只短毛橘猫，琥珀色眼睛，白色胸口毛，体型与面部花纹保持一致。",
+      "control": "identity"
+    },
+    {
+      "name": "荧光灯走廊",
+      "kind": "scene",
+      "description": "低饱和后室走廊场景约束。",
+      "tags": ["场景", "后室", "荧光灯"],
+      "prompt_hint": "重复的米黄色墙面与潮湿地毯，天花板荧光灯稳定发光，空间连续且拓扑不突变。",
+      "control": "scene"
+    }
+  ]
+}

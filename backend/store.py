@@ -56,9 +56,38 @@ class JobStore:
                     prompt_id TEXT,
                     reference_path TEXT,
                     output_path TEXT,
-                    error TEXT
+                    error TEXT,
+                    asset_ids_json TEXT NOT NULL DEFAULT '[]'
                 )
                 """
+            )
+            job_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(jobs)")
+            }
+            if "asset_ids_json" not in job_columns:
+                connection.execute(
+                    "ALTER TABLE jobs ADD COLUMN asset_ids_json TEXT NOT NULL DEFAULT '[]'"
+                )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS assets (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    kind TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    tags_json TEXT NOT NULL DEFAULT '[]',
+                    prompt_hint TEXT NOT NULL DEFAULT '',
+                    control TEXT NOT NULL DEFAULT 'reference',
+                    file_name TEXT,
+                    mime_type TEXT,
+                    file_path TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_assets_created_at ON assets(created_at DESC)"
             )
             connection.commit()
 
@@ -86,6 +115,7 @@ class JobStore:
             "reference_path": values.get("reference_path"),
             "output_path": None,
             "error": None,
+            "asset_ids_json": json.dumps(values.get("asset_ids", [])),
         }
         columns = ", ".join(record)
         placeholders = ", ".join(f":{column}" for column in record)
@@ -163,11 +193,74 @@ class JobStore:
             raise KeyError(job_id)
         return self.get(job_id)
 
+    def create_asset(self, values: dict[str, Any]) -> dict[str, Any]:
+        now = utc_now()
+        record = {
+            "id": values["id"],
+            "name": values["name"],
+            "kind": values["kind"],
+            "description": values.get("description", ""),
+            "tags_json": json.dumps(values.get("tags", []), ensure_ascii=False),
+            "prompt_hint": values.get("prompt_hint", ""),
+            "control": values.get("control", "reference"),
+            "file_name": values.get("file_name"),
+            "mime_type": values.get("mime_type"),
+            "file_path": values.get("file_path"),
+            "created_at": now,
+            "updated_at": now,
+        }
+        columns = ", ".join(record)
+        placeholders = ", ".join(f":{column}" for column in record)
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                f"INSERT INTO assets ({columns}) VALUES ({placeholders})", record
+            )
+            connection.commit()
+        return self.get_asset(record["id"])
+
+    def get_asset(self, asset_id: str) -> dict[str, Any]:
+        with self._lock, self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM assets WHERE id = ?", (asset_id,)
+            ).fetchone()
+        if row is None:
+            raise KeyError(asset_id)
+        return self._decode_asset(row)
+
+    def list_assets(self, limit: int = 500) -> list[dict[str, Any]]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM assets ORDER BY created_at DESC LIMIT ?", (limit,)
+            ).fetchall()
+        return [self._decode_asset(row) for row in rows]
+
+    def get_assets(self, asset_ids: list[str]) -> list[dict[str, Any]]:
+        if not asset_ids:
+            return []
+        return [self.get_asset(asset_id) for asset_id in asset_ids]
+
+    def asset_paths(self, asset_ids: list[str]) -> list[str]:
+        return [
+            asset["file_path"]
+            for asset in self.get_assets(asset_ids)
+            if asset.get("file_path")
+        ]
+
     @staticmethod
     def _decode(row: sqlite3.Row, include_workflow: bool = False) -> dict[str, Any]:
         result = dict(row)
         result["simulated"] = bool(result["simulated"])
         workflow_json = result.pop("workflow_json", None)
+        asset_ids_json = result.pop("asset_ids_json", "[]")
+        result["asset_ids"] = json.loads(asset_ids_json) if asset_ids_json else []
         if include_workflow:
             result["workflow"] = json.loads(workflow_json) if workflow_json else None
+        return result
+
+    @staticmethod
+    def _decode_asset(row: sqlite3.Row) -> dict[str, Any]:
+        result = dict(row)
+        tags_json = result.pop("tags_json", "[]")
+        result["tags"] = json.loads(tags_json) if tags_json else []
+        result["has_file"] = bool(result.get("file_path"))
         return result

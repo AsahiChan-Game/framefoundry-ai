@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 
 from .comfyui import (
     ComfyUIClient,
@@ -22,16 +23,20 @@ from .comfyui import (
     validate_workflow,
 )
 from .config import (
+    ASSET_DIR,
+    DATABASE_PATH,
     MAX_REFERENCE_BYTES,
     NODES,
     OUTPUT_DIR,
     REAL_JOB_TIMEOUT_SECONDS,
     UPLOAD_DIR,
-    DATABASE_PATH,
     NodeConfig,
     prepare_directories,
 )
 from .models import (
+    AssetCreate,
+    AssetPackImport,
+    AssetResponse,
     JobCreate,
     JobResponse,
     WorkflowValidateRequest,
@@ -68,11 +73,15 @@ def public_job(record: dict[str, Any]) -> JobResponse:
     return JobResponse.model_validate(record)
 
 
+def public_asset(record: dict[str, Any]) -> AssetResponse:
+    return AssetResponse.model_validate(record)
+
+
 def _safe_filename(filename: str) -> str:
     filename = Path(filename).name
     suffix = Path(filename).suffix.lower()
     if suffix not in ALLOWED_REFERENCE_SUFFIXES:
-        raise HTTPException(status_code=415, detail=f"不支持的参考素材类型：{suffix or '无扩展名'}")
+        raise HTTPException(status_code=415, detail=f"不支持的素材类型：{suffix or '无扩展名'}")
     stem = re.sub(r"[^a-zA-Z0-9._-]+", "-", Path(filename).stem).strip("-.")
     if not stem:
         stem = "reference"
@@ -101,6 +110,49 @@ def save_reference(job_id: str, payload: JobCreate) -> str | None:
         raise HTTPException(status_code=400, detail="无效的素材文件名")
     target.write_bytes(raw)
     return str(target)
+
+
+def decode_asset_file(payload: AssetCreate) -> tuple[bytes, str] | None:
+    if not payload.file_data or not payload.file_name:
+        return None
+    try:
+        raw = base64.b64decode(payload.file_data, validate=True)
+    except (ValueError, binascii.Error) as exc:
+        raise HTTPException(status_code=422, detail="资产文件不是有效的 Base64 数据") from exc
+    if len(raw) > MAX_REFERENCE_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"资产文件超过 {MAX_REFERENCE_BYTES // (1024 * 1024)} MB 限制",
+        )
+    return raw, _safe_filename(payload.file_name)
+
+
+def save_asset_file(asset_id: str, payload: AssetCreate) -> str | None:
+    decoded = decode_asset_file(payload)
+    if decoded is None:
+        return None
+    raw, safe_name = decoded
+    asset_directory = (ASSET_DIR / asset_id).resolve()
+    if ASSET_DIR not in asset_directory.parents:
+        raise HTTPException(status_code=400, detail="无效的资产保存路径")
+    asset_directory.mkdir(parents=True, exist_ok=True)
+    target = (asset_directory / safe_name).resolve()
+    if asset_directory not in target.parents:
+        raise HTTPException(status_code=400, detail="无效的资产文件名")
+    target.write_bytes(raw)
+    return str(target)
+
+
+def create_asset_record(payload: AssetCreate) -> dict[str, Any]:
+    asset_id = uuid.uuid4().hex[:16]
+    file_path = save_asset_file(asset_id, payload)
+    return store.create_asset(
+        {
+            **payload.model_dump(exclude={"file_data"}),
+            "id": asset_id,
+            "file_path": file_path,
+        }
+    )
 
 
 async def probe_node(node: NodeConfig) -> dict[str, Any]:
@@ -168,6 +220,7 @@ async def run_simulated_job(job: dict[str, Any]) -> None:
                     "mode": job["mode"],
                     "resolution": job["resolution"],
                     "duration_seconds": job["duration_seconds"],
+                    "asset_ids": job.get("asset_ids", []),
                 },
             },
             ensure_ascii=False,
@@ -192,12 +245,19 @@ async def run_real_job(job: dict[str, Any]) -> None:
     if target is None:
         raise ValueError(f"未知目标节点：{job['target_node']}")
 
+    asset_paths = store.asset_paths(job.get("asset_ids", []))
+    reference_paths = list(
+        dict.fromkeys(
+            [path for path in [job.get("reference_path"), *asset_paths] if path]
+        )
+    )
     variables = {
         "prompt": job["prompt"],
         "seed": job["seed"] if job["seed"] is not None else -1,
         "duration_seconds": job["duration_seconds"],
         "resolution": job["resolution"],
-        "reference_path": job.get("reference_path") or "",
+        "reference_path": reference_paths[0] if reference_paths else "",
+        "reference_paths": reference_paths,
         "output_dir": str((OUTPUT_DIR / job["id"]).resolve()),
         "job_id": job["id"],
     }
@@ -286,7 +346,7 @@ async def lifespan(_: FastAPI):
 app = FastAPI(
     title="FrameFoundry AI Control API",
     version="1.0.0",
-    description="帧造工场本地任务、节点探测与 ComfyUI 调度 API。",
+    description="帧造工场本地任务、资产、节点探测与 ComfyUI 调度 API。",
     lifespan=lifespan,
 )
 app.add_middleware(
@@ -318,6 +378,61 @@ async def list_nodes() -> dict[str, Any]:
     return {"nodes": await asyncio.gather(*(probe_node(node) for node in NODES))}
 
 
+@app.get("/api/assets")
+async def list_assets(
+    limit: int = Query(default=500, ge=1, le=500),
+) -> dict[str, Any]:
+    return {"assets": [public_asset(record) for record in store.list_assets(limit)]}
+
+
+@app.get("/api/assets/{asset_id}", response_model=AssetResponse)
+async def get_asset(asset_id: str) -> AssetResponse:
+    try:
+        return public_asset(store.get_asset(asset_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="资产不存在") from exc
+
+
+@app.get("/api/assets/{asset_id}/content")
+async def get_asset_content(asset_id: str) -> FileResponse:
+    try:
+        asset = store.get_asset(asset_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="资产不存在") from exc
+    file_path = asset.get("file_path")
+    resolved_path = Path(file_path).resolve() if file_path else None
+    if (
+        resolved_path is None
+        or ASSET_DIR not in resolved_path.parents
+        or not resolved_path.is_file()
+    ):
+        raise HTTPException(status_code=404, detail="资产没有可预览文件")
+    return FileResponse(
+        resolved_path,
+        media_type=asset.get("mime_type") or "application/octet-stream",
+        filename=asset.get("file_name") or Path(file_path).name,
+        content_disposition_type="inline",
+    )
+
+
+@app.post("/api/assets", response_model=AssetResponse, status_code=201)
+async def create_asset(payload: AssetCreate) -> AssetResponse:
+    return public_asset(create_asset_record(payload))
+
+
+@app.post("/api/assets/import", status_code=201)
+async def import_asset_pack(payload: AssetPackImport) -> dict[str, Any]:
+    for asset in payload.assets:
+        decode_asset_file(asset)
+    imported = [public_asset(create_asset_record(asset)) for asset in payload.assets]
+    return {
+        "pack_name": payload.pack_name,
+        "version": payload.version,
+        "imported_count": len(imported),
+        "assets": imported,
+    }
+
+
 @app.get("/api/jobs")
 async def list_jobs(limit: int = Query(default=100, ge=1, le=500)) -> dict[str, Any]:
     return {"jobs": [public_job(record) for record in store.list(limit=limit)]}
@@ -337,6 +452,15 @@ async def create_job(payload: JobCreate) -> JobResponse:
         raise HTTPException(status_code=422, detail="目标节点不在允许列表中")
     job_id = uuid.uuid4().hex[:16]
     reference_path = save_reference(job_id, payload)
+    try:
+        selected_assets = store.get_assets(payload.asset_ids)
+    except KeyError as exc:
+        raise HTTPException(status_code=422, detail=f"资产不存在：{exc.args[0]}") from exc
+    if reference_path is None:
+        reference_path = next(
+            (asset.get("file_path") for asset in selected_assets if asset.get("file_path")),
+            None,
+        )
     record = store.create(
         {
             **payload.model_dump(

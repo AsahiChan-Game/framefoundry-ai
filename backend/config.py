@@ -34,6 +34,9 @@ OUTPUT_DIR = Path(
 UPLOAD_DIR = Path(
     os.getenv("FRAMEFOUNDRY_UPLOAD_DIR", DATA_DIR / "uploads")
 ).resolve()
+ASSET_DIR = Path(
+    os.getenv("FRAMEFOUNDRY_ASSET_DIR", DATA_DIR / "assets")
+).resolve()
 REAL_JOB_TIMEOUT_SECONDS = int(
     os.getenv("FRAMEFOUNDRY_REAL_JOB_TIMEOUT_SECONDS", "3600")
 )
@@ -77,5 +80,5 @@ NODES = (
 
 
 def prepare_directories() -> None:
-    for directory in (DATA_DIR, OUTPUT_DIR, UPLOAD_DIR):
+    for directory in (DATA_DIR, OUTPUT_DIR, UPLOAD_DIR, ASSET_DIR):
         directory.mkdir(parents=True, exist_ok=True)

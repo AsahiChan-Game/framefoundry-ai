@@ -18,6 +18,8 @@
 
 当前版本：`v1.0.0`。这是独立项目，不是 MoneyPrinterTurbo 的分支，也不包含任何模型权重。
 
+> 本地开发版已加入资产中心：角色、场景、风格、道具、音频与自定义资产可登记、预览、导入并加入生成任务。
+
 ## 1.0 已实现
 
 - 中文创作台：项目名、提示词、T2VA / I2VA / FL2VA / Ref2VA、分辨率、时长和 seed。
@@ -98,6 +100,7 @@ ComfyUI 实例中的完整节点图；跨 `8189`、`8190`、`8191` 多服务自�
    - `{{duration_seconds}}`
    - `{{resolution}}`
    - `{{reference_path}}`
+   - `{{reference_paths}}`
    - `{{output_dir}}`
    - `{{job_id}}`
 
@@ -117,6 +120,7 @@ ComfyUI 实例中的完整节点图；跨 `8189`、`8190`、`8191` 多服务自�
 ```text
 data/
 ├── framefoundry.db
+├── assets/<asset-id>/
 ├── uploads/<job-id>/
 └── outputs/<job-id>/
 ```
@@ -135,6 +139,10 @@ GitHub 仓库。
 | `GET` | `/api/jobs/{id}` | 查询任务详情 |
 | `POST` | `/api/jobs/{id}/cancel` | 停止本地跟踪并标记取消 |
 | `POST` | `/api/workflows/validate` | 校验 API 工作流节点与占位符 |
+| `GET` | `/api/assets` | 获取本地资产列表 |
+| `POST` | `/api/assets` | 新增角色、场景、风格等资产 |
+| `POST` | `/api/assets/import` | 导入 JSON 资产包 |
+| `GET` | `/api/assets/{id}/content` | 预览本地资产文件 |
 
 ## 验证
 
